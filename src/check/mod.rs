@@ -8,6 +8,11 @@
 //! - [`pat`], [`call`], [`ops`], [`coerce`]: pattern, argument, operation, and
 //!   coercion rules.
 //! - [`dynamic`]: the `Dynamic` discipline.
+//! - [`generics`]: placeholders, bounds, substitution, instantiation.
+//! - [`traits`]: the impl index, obligations, normalization, member lookup,
+//!   coherence, conformance.
+//! - [`exhaust`]: exhaustiveness and usefulness through match-lang.
+//! - [`plan`]: the monomorphization plan.
 //! - [`finalize`]: literal defaults, inference failures, and resolving every
 //!   recorded type.
 
@@ -15,30 +20,41 @@ mod call;
 mod coerce;
 mod dynamic;
 mod engine;
+mod exhaust;
 mod finalize;
+mod generics;
 mod index;
 mod items;
 mod lower;
 mod ops;
 mod pat;
 mod paths;
+mod plan;
+mod traits;
 
-use alloc::vec::Vec;
+use alloc::{collections::BTreeMap, vec::Vec};
 
 use hir_lang::{
-    BinderId, Def, DefId, ExprId, Hir, IdKind, IntLit, ItemId, NodeRef, PatId, PathId, Prim, Symbol,
+    BinderId, Def, DefId, ExprId, Hir, IdKind, IntLit, ItemId, NodeRef, PatId, PathId, Prim,
+    Symbol, TyId,
 };
 
 use crate::{
-    diag::{Diagnostic, DiagnosticKind},
+    diag::{Diagnostic, DiagnosticKind, Severity},
     error::{Budget, CheckError, Meter},
     infer::{Infer, UnifyCfg},
+    mono::{Strategy, Use},
     profile::{Profile, RecordTyping},
-    typed::{Coercion, NONE, Typed},
+    typed::{Coercion, NONE, Typed, WNode},
     types::{Field, Tag, TypeId, Types},
 };
 
 pub(crate) use index::Index;
+
+/// The hard cap on re-entrant lowering and normalization (each level is a
+/// few stack frames; chains of associated types defined through others are
+/// rarely more than a handful deep).
+const NEST_CAP: u32 = 32;
 
 /// The configured path: declare host types, set a budget, then check.
 ///
@@ -94,6 +110,8 @@ pub(crate) struct Host {
     pub(crate) intrinsics: Vec<(Symbol, TypeId)>,
     /// Methods and associated items of host types: (owner, name, type).
     pub(crate) members: Vec<(TypeId, Symbol, TypeId)>,
+    /// Attributes that force a monomorphization strategy, by name.
+    pub(crate) mono_attrs: Vec<(Symbol, Strategy)>,
 }
 
 fn upsert<K: Ord + Copy, V>(table: &mut Vec<(K, V)>, key: K, value: V) {
@@ -338,6 +356,33 @@ impl<'h> Checker<'h> {
         self
     }
 
+    /// Makes an attribute named `name` on a generic item force `strategy`
+    /// in the monomorphization plan, whatever the profile's
+    /// [`MonoPolicy`](crate::MonoPolicy) says (a language's `@inline` or
+    /// `@hot` copies; `@shared` shares). A later declaration of the same
+    /// name replaces it.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use hir_lang::Builder;
+    /// use intern_lang::Interner;
+    /// use typeck_lang::{Checker, Profile, Strategy};
+    ///
+    /// let mut names = Interner::new();
+    /// let mut b = Builder::new();
+    /// let root = b.module(None, &[]);
+    /// let hir = b.finish(root)?;
+    /// let mut checker = Checker::new(&hir, Profile::static_inferred());
+    /// checker.declare_mono_attribute(names.intern("hot"), Strategy::Copy);
+    /// assert!(checker.check().unwrap().is_ok());
+    /// # Ok::<(), hir_lang::HirError>(())
+    /// ```
+    pub fn declare_mono_attribute(&mut self, name: Symbol, strategy: Strategy) -> &mut Self {
+        upsert(&mut self.host.mono_attrs, name, strategy);
+        self
+    }
+
     /// Runs the check.
     ///
     /// # Errors
@@ -398,6 +443,9 @@ impl<'h> Checker<'h> {
 /// A function or closure being checked.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Frame {
+    /// The declared result before generator and opaque rewriting (what a
+    /// `?` must propagate into).
+    pub(crate) declared: TypeId,
     /// What `return` values must be.
     pub(crate) ret: TypeId,
     /// The declared thrown type, if any.
@@ -434,7 +482,6 @@ pub(crate) struct Ctx<'h> {
     pub(crate) diags: Vec<Diagnostic>,
     pub(crate) methods: Vec<(ExprId, ItemId)>,
     pub(crate) coercions: Vec<(ExprId, Coercion, TypeId)>,
-    pub(crate) deferred: Vec<ExprId>,
 
     // Checking state.
     /// The type each expression must coerce to, set by its parent.
@@ -479,24 +526,86 @@ pub(crate) struct Ctx<'h> {
     pub(crate) null_checks: Vec<ExprId>,
     /// Expressions whose expectation moved to their branches (stack).
     pub(crate) delegated: Vec<(ExprId, TypeId)>,
-    /// Record literals' targets between entry and exit (stack).
-    pub(crate) record_targets: Vec<(ExprId, paths::RecordRef)>,
+    /// Record literals' targets and instance types between entry and exit
+    /// (stack).
+    pub(crate) record_targets: Vec<(ExprId, paths::RecordRef, TypeId)>,
     /// `let` annotations between entry and the pattern (stack).
     pub(crate) let_types: Vec<(hir_lang::StmtId, TypeId)>,
     /// Closure types between entry and exit (stack).
     pub(crate) closure_types: Vec<TypeId>,
     /// Per path: the definition the checker resolved its tail to.
     pub(crate) path_def: Vec<Option<Def>>,
-    /// Per expression: the function item a callee path names (`NONE`).
-    pub(crate) callee_fns: Vec<u32>,
+    /// Per expression: the (instantiated) signature a callee path names
+    /// (`NONE`).
+    pub(crate) callee_sigs: Vec<u32>,
     /// Call targets between a call's preparation and its finish.
     pub(crate) call_stack: Vec<call::CallTarget>,
+    /// Expectations for a call's arguments derived from its expected
+    /// result, between its preparation and its finish (stack).
+    pub(crate) probes: Vec<(ExprId, Vec<Option<TypeId>>)>,
     /// The engine's task stack, reused across roots.
     pub(crate) tasks: Vec<engine::Task>,
     /// Visited marks for walks over class hierarchies (epoch-stamped, so a
     /// new walk costs nothing to start).
     pub(crate) item_stamp: Vec<u32>,
     pub(crate) item_epoch: u32,
+
+    // Generics.
+    /// The item whose body is being checked (its bounds are in scope).
+    pub(crate) cur_item: Option<ItemId>,
+    /// The item whose annotations are being lowered, when not `cur_item`.
+    pub(crate) lower_ctx: Option<ItemId>,
+    pub(crate) param_lists: Vec<generics::ParamList>,
+    pub(crate) params_memo: Vec<u32>,
+    pub(crate) bound_lists: Vec<generics::BoundList>,
+    pub(crate) bounds_memo: Vec<u32>,
+    /// While an item's bounds are being lowered: the list being filled.
+    pub(crate) bounds_partial: Vec<u32>,
+    /// `impl Trait` type nodes of function signatures: (type node, function,
+    /// return position), sorted by function; and (type node, position in
+    /// that table), sorted by type node.
+    pub(crate) impl_tys: Vec<(TyId, ItemId, bool)>,
+    pub(crate) impl_ty_index: Vec<(TyId, u32)>,
+    pub(crate) subst_memo: Vec<u32>,
+    pub(crate) subst_stamp: Vec<u32>,
+    pub(crate) subst_epoch: u32,
+
+    // Interfaces.
+    pub(crate) tr: traits::TraitIndex,
+    pub(crate) pending: Vec<traits::Obligation>,
+    /// Obligations still undecided at the end of their item.
+    pub(crate) stuck: Vec<traits::Obligation>,
+    pub(crate) solve_depth: u32,
+    pub(crate) norm_depth: u32,
+    /// Hidden types of `impl Trait` results.
+    pub(crate) hidden: Vec<(TyId, TypeId)>,
+
+    /// Where the coercion being checked happens (for the goals a `dyn`
+    /// coercion queues).
+    pub(crate) coerce_site: NodeRef,
+    /// Re-entrance depth of type lowering.
+    pub(crate) lower_depth: u32,
+    /// Visited marks for walks over type DAGs (epoch-stamped).
+    pub(crate) walk_stamp: Vec<u32>,
+    pub(crate) walk_epoch: u32,
+    /// The conversion interface of the `?` hook, once looked up.
+    pub(crate) try_iface: Option<Option<ItemId>>,
+
+    // Plan.
+    pub(crate) uses: Vec<Use>,
+    /// Values coerced to `dyn` types: (item, type, interface): the plan
+    /// adds the implementation's methods (the vtable).
+    pub(crate) dyn_uses: Vec<(Option<ItemId>, TypeId, TypeId)>,
+    pub(crate) use_args: Vec<TypeId>,
+    /// Live HIR nodes per item (its own body, not nested items).
+    pub(crate) item_size: Vec<u32>,
+
+    // Exhaustiveness.
+    pub(crate) matches: Vec<ExprId>,
+    pub(crate) lit_ids: BTreeMap<Vec<u8>, u64>,
+    pub(crate) witnesses: Vec<(ExprId, u32, u32)>,
+    pub(crate) wnodes: Vec<WNode>,
+    pub(crate) wsyms: Vec<Symbol>,
 }
 
 impl<'h> Ctx<'h> {
@@ -517,7 +626,6 @@ impl<'h> Ctx<'h> {
             diags: Vec::new(),
             methods: Vec::new(),
             coercions: Vec::new(),
-            deferred: Vec::new(),
             expect: alloc::vec![NONE; n(IdKind::Expr)],
             poisoned: alloc::vec![false; n(IdKind::Expr)],
             int_lits: Vec::new(),
@@ -543,19 +651,81 @@ impl<'h> Ctx<'h> {
             closure_types: Vec::new(),
             path_def: alloc::vec![None; n(IdKind::Path)],
             null_checks: Vec::new(),
-            callee_fns: alloc::vec![NONE; n(IdKind::Expr)],
+            callee_sigs: alloc::vec![NONE; n(IdKind::Expr)],
             call_stack: Vec::new(),
+            probes: Vec::new(),
             tasks: Vec::new(),
             item_stamp: alloc::vec![0; n(IdKind::Item)],
             item_epoch: 0,
+            cur_item: None,
+            lower_ctx: None,
+            param_lists: Vec::new(),
+            params_memo: alloc::vec![NONE; n(IdKind::Item)],
+            bound_lists: Vec::new(),
+            bounds_memo: alloc::vec![NONE; n(IdKind::Item)],
+            bounds_partial: alloc::vec![NONE; n(IdKind::Item)],
+            impl_tys: Vec::new(),
+            impl_ty_index: Vec::new(),
+            subst_memo: Vec::new(),
+            subst_stamp: Vec::new(),
+            subst_epoch: 0,
+            tr: traits::TraitIndex::default(),
+            pending: Vec::new(),
+            stuck: Vec::new(),
+            solve_depth: 0,
+            norm_depth: 0,
+            hidden: Vec::new(),
+            coerce_site: NodeRef::Item(hir.root()),
+            lower_depth: 0,
+            try_iface: None,
+            walk_stamp: Vec::new(),
+            walk_epoch: 0,
+            uses: Vec::new(),
+            dyn_uses: Vec::new(),
+            use_args: Vec::new(),
+            item_size: alloc::vec![0; n(IdKind::Item)],
+            matches: Vec::new(),
+            lit_ids: BTreeMap::new(),
+            witnesses: Vec::new(),
+            wnodes: Vec::new(),
+            wsyms: Vec::new(),
         }
     }
 
     // ------------------------------------------------------------ helpers
 
     pub(crate) fn report(&mut self, node: NodeRef, kind: DiagnosticKind) {
+        self.report_with(node, kind, Severity::Error);
+    }
+
+    pub(crate) fn report_with(&mut self, node: NodeRef, kind: DiagnosticKind, severity: Severity) {
         let origin = self.hir.origin(node);
-        self.diags.push(Diagnostic { kind, node, origin });
+        self.diags.push(Diagnostic {
+            kind,
+            node,
+            origin,
+            severity,
+        });
+    }
+
+    /// Records a use of `callee` with `args` at `at`, for the plan and
+    /// [`Typed::instantiation`].
+    pub(crate) fn record_use(
+        &mut self,
+        at: ExprId,
+        callee: ItemId,
+        args: &[TypeId],
+        dispatch: crate::mono::Dispatch,
+    ) {
+        let start = u32::try_from(self.use_args.len()).unwrap_or(NONE);
+        self.use_args.extend_from_slice(args);
+        self.uses.push(Use {
+            at,
+            owner: self.cur_item,
+            callee,
+            args: (start, u32::try_from(args.len()).unwrap_or(0)),
+            dispatch,
+        });
     }
 
     pub(crate) fn fresh(&mut self, class: u8) -> TypeId {
@@ -687,6 +857,14 @@ impl<'h> Ctx<'h> {
         if let Some(slot) = self.path_def.get_mut(path.index()) {
             *slot = Some(def);
         }
+    }
+
+    /// How deep the re-entrant steps (lowering through generic defaults,
+    /// normalizing associated types defined through others) may nest: the
+    /// budget's trait depth, but never more than [`NEST_CAP`], so they
+    /// stay well inside any thread's stack.
+    pub(crate) fn nest_limit(&self) -> u32 {
+        self.meter.budget.trait_depth.min(NEST_CAP)
     }
 
     /// Starts a new walk over items (see [`visit`](Self::visit)).

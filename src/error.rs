@@ -32,14 +32,22 @@ pub struct Budget {
     pub steps: u64,
     /// Type-store size: nodes plus pooled children.
     pub type_nodes: usize,
+    /// How deep interface resolution may nest: goals arising from the
+    /// bounds of the implementation that satisfies another goal,
+    /// associated types defined through other associated types, and the
+    /// chain of generic instances in the monomorphization plan. A cyclic or
+    /// ever-growing resolution reaches it instead of looping.
+    pub trait_depth: u32,
 }
 
 impl Default for Budget {
-    /// 50 million steps and 64 million type-store entries.
+    /// 50 million steps, 64 million type-store entries, and a trait depth
+    /// of 256.
     fn default() -> Self {
         Self {
             steps: 50_000_000,
             type_nodes: 1 << 26,
+            trait_depth: 256,
         }
     }
 }
@@ -81,6 +89,7 @@ impl Budget {
         Self {
             steps: base.steps.max((nodes as u64).saturating_mul(256)),
             type_nodes: base.type_nodes.max(nodes.saturating_mul(64)),
+            trait_depth: base.trait_depth,
         }
     }
 }
@@ -101,6 +110,8 @@ pub enum Limit {
     Steps,
     /// [`Budget::type_nodes`].
     TypeNodes,
+    /// [`Budget::trait_depth`].
+    TraitDepth,
 }
 
 /// Why a check did not produce a [`Typed`](crate::Typed).
@@ -122,8 +133,9 @@ pub enum Limit {
 #[non_exhaustive]
 pub enum CheckError {
     /// The profile's discipline is designed but not implemented in this
-    /// version (see [`Discipline::is_implemented`]). Use `Dynamic` or
-    /// `StaticExplicit`, or a later version of the crate.
+    /// version (see [`Discipline::is_implemented`]). Use `Dynamic`,
+    /// `StaticExplicit`, or `StaticInferred`, or a later version of the
+    /// crate.
     NotImplemented {
         /// The requested discipline.
         discipline: Discipline,
@@ -157,6 +169,7 @@ impl fmt::Display for CheckError {
                 match limit {
                     Limit::Steps => "step",
                     Limit::TypeNodes => "type-store",
+                    Limit::TraitDepth => "trait-resolution depth",
                 }
             ),
         }

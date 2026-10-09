@@ -8,36 +8,30 @@
 use alloc::string::String;
 use core::fmt::Write as _;
 
-use hir_lang::{Member, NodeRef, OpKind, Origin, Symbol, VariantId};
+use hir_lang::{ItemId, Member, NodeRef, OpKind, Origin, Symbol, VariantId};
 use intern_lang::Lookup;
 
 use crate::types::{TypeId, Types};
 
 /// A language feature the checker recognises but this version does not
-/// check under the profile's discipline. Each is scheduled in
-/// `dev/ROADMAP.md`.
+/// check. Each is recorded in `dev/ROADMAP.md`.
 ///
 /// # Examples
 ///
 /// ```
 /// use typeck_lang::Feature;
 ///
-/// assert_eq!(Feature::Generics.name(), "generics");
+/// assert_eq!(Feature::GenericAssocTypes.name(), "generic associated types");
 /// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum Feature {
-    /// Generic items, generic arguments, and uses of generic items (0.5).
-    Generics,
-    /// Interfaces and traits used as types (`dyn`, `impl`, interface paths,
-    /// qualified paths, `T::method` on a type parameter) (0.5).
-    Traits,
-    /// Associated types and multi-segment associated paths (`T::Item`,
-    /// `A::B::c`) (0.5).
-    AssociatedTypes,
-    /// `impl` blocks on structural types (tuples, arrays, references) (0.5,
-    /// with generics).
-    StructuralImpls,
+    /// Associated types with generic parameters of their own (`type
+    /// Item<'a>`, `type Map<T>`).
+    GenericAssocTypes,
+    /// Multi-segment unresolved paths (`T::Assoc::method`): resolution by
+    /// type covers one trailing segment.
+    LongAssocPaths,
 }
 
 impl Feature {
@@ -46,17 +40,32 @@ impl Feature {
     /// # Examples
     ///
     /// ```
-    /// assert_eq!(typeck_lang::Feature::Traits.name(), "traits and interfaces as types");
+    /// assert_eq!(typeck_lang::Feature::LongAssocPaths.name(), "multi-segment associated paths");
     /// ```
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
-            Self::Generics => "generics",
-            Self::Traits => "traits and interfaces as types",
-            Self::AssociatedTypes => "associated types",
-            Self::StructuralImpls => "impl blocks on structural types",
+            Self::GenericAssocTypes => "generic associated types",
+            Self::LongAssocPaths => "multi-segment associated paths",
         }
     }
+}
+
+/// How serious a diagnostic is.
+///
+/// # Examples
+///
+/// ```
+/// use typeck_lang::Severity;
+///
+/// assert!(Severity::Warning < Severity::Error);
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Severity {
+    /// Legal, but almost certainly a mistake (an unreachable `match` arm).
+    Warning,
+    /// The program is ill-typed under the profile.
+    Error,
 }
 
 /// What a diagnostic says. Types are ids into the
@@ -228,10 +237,94 @@ pub enum DiagnosticKind {
         /// The nullable type.
         ty: TypeId,
     },
-    /// A `match` that leaves values uncovered.
+    /// A `match` that leaves values uncovered. The values are listed by
+    /// [`Typed::witnesses`](crate::Typed::witnesses) and in the message.
     NonExhaustive {
-        /// A variant no arm covers, when the scrutinee is a sum.
+        /// The variant the first missing value starts with, when the
+        /// scrutinee is a sum.
         missing: Option<VariantId>,
+    },
+    /// A `match` arm no value reaches (a warning).
+    UnreachableArm,
+    /// An or-pattern alternative that only matches values earlier
+    /// alternatives or arms already match (a warning).
+    RedundantAlternative,
+    /// A bound, supertrait, or `impl` header names something that is not an
+    /// interface.
+    NotAnInterface,
+    /// The wrong number of generic arguments.
+    GenericArity {
+        /// How many the item declares.
+        expected: u32,
+        /// How many are written.
+        found: u32,
+    },
+    /// `T::Name` or `Iface<Name = ..>` where no interface in reach declares
+    /// an associated type `Name`.
+    NoAssocType {
+        /// The name.
+        name: Symbol,
+    },
+    /// `T::Name` where several interfaces of `T` declare `Name`; qualify it
+    /// (`<T as Iface>::Name`).
+    AmbiguousAssocType {
+        /// The name.
+        name: Symbol,
+    },
+    /// A type does not implement an interface it must.
+    Unsatisfied {
+        /// The type.
+        ty: TypeId,
+        /// The interface (with its arguments).
+        interface: TypeId,
+    },
+    /// Several implementations of an interface apply to a type.
+    AmbiguousImpl {
+        /// The type.
+        ty: TypeId,
+        /// The interface.
+        interface: TypeId,
+    },
+    /// Two implementations of one interface overlap (reported at the
+    /// later one).
+    OverlappingImpls {
+        /// The earlier implementation.
+        other: ItemId,
+    },
+    /// An implementation lacks members its interface requires.
+    MissingMember {
+        /// The first missing member.
+        name: Symbol,
+        /// How many are missing.
+        count: u32,
+    },
+    /// An implementation defines a member its interface does not declare.
+    NotAMember {
+        /// The interface.
+        interface: TypeId,
+        /// The member.
+        name: Symbol,
+    },
+    /// An interface name used as a type under `Traits` polymorphism (write
+    /// `dyn Iface` or `impl Iface`).
+    InterfaceAsType,
+    /// `impl Trait` outside a function's parameter or return types.
+    ImplTraitPosition,
+    /// A `dyn` type that leaves an associated type of its interface
+    /// unspecified (`dyn Iterator` without `Item = ..`).
+    MissingAssocBinding {
+        /// The associated type.
+        name: Symbol,
+    },
+    /// Instantiating a generic item needs ever-larger instances
+    /// (polymorphic recursion), which copies cannot implement: the plan
+    /// stops at the budget's trait depth.
+    RecursiveInstantiation,
+    /// A `?` (through [`TryHook::Intrinsic`](crate::TryHook)) on a value, or
+    /// in a function, that is not a carrier of the same kind.
+    TryCarrier {
+        /// The offending type.
+        ty: TypeId,
     },
     /// A feature this version does not check (see [`Feature`]).
     Unsupported {
@@ -307,6 +400,22 @@ impl DiagnosticKind {
             Self::NotAwaitable { .. } => "T0037",
             Self::NotAssignable => "T0038",
             Self::UnionLiteral { .. } => "T0039",
+            Self::UnreachableArm => "T0040",
+            Self::RedundantAlternative => "T0041",
+            Self::NotAnInterface => "T0042",
+            Self::GenericArity { .. } => "T0043",
+            Self::NoAssocType { .. } => "T0044",
+            Self::AmbiguousAssocType { .. } => "T0045",
+            Self::Unsatisfied { .. } => "T0046",
+            Self::AmbiguousImpl { .. } => "T0047",
+            Self::OverlappingImpls { .. } => "T0048",
+            Self::MissingMember { .. } => "T0049",
+            Self::NotAMember { .. } => "T0050",
+            Self::InterfaceAsType => "T0051",
+            Self::ImplTraitPosition => "T0052",
+            Self::MissingAssocBinding { .. } => "T0053",
+            Self::RecursiveInstantiation => "T0054",
+            Self::TryCarrier { .. } => "T0055",
         }
     }
 
@@ -322,6 +431,12 @@ impl DiagnosticKind {
                 f(from);
                 f(to);
             }
+            Self::Unsatisfied { ty, interface } | Self::AmbiguousImpl { ty, interface } => {
+                f(ty);
+                f(interface);
+            }
+            Self::NotAMember { interface, .. } => f(interface),
+            Self::TryCarrier { ty } => f(ty),
             Self::NotCallable { ty }
             | Self::NoField { ty, .. }
             | Self::NoMethod { ty, .. }
@@ -484,6 +599,67 @@ impl DiagnosticKind {
                 out.push_str(" may be null");
             }
             Self::NonExhaustive { .. } => out.push_str("non-exhaustive match"),
+            Self::UnreachableArm => out.push_str("unreachable match arm"),
+            Self::RedundantAlternative => {
+                out.push_str("this alternative only matches values already matched");
+            }
+            Self::NotAnInterface => out.push_str("this does not name an interface"),
+            Self::GenericArity { expected, found } => {
+                let _ = write!(out, "expected {expected} generic arguments, found {found}");
+            }
+            Self::NoAssocType { name: n } => {
+                out.push_str("no associated type ");
+                name(Some(n), out);
+                out.push_str(" in reach");
+            }
+            Self::AmbiguousAssocType { name: n } => {
+                out.push_str("several interfaces declare an associated type ");
+                name(Some(n), out);
+            }
+            Self::Unsatisfied { ty: t, interface } => {
+                ty(t, out);
+                out.push_str(" does not implement ");
+                ty(interface, out);
+            }
+            Self::AmbiguousImpl { ty: t, interface } => {
+                out.push_str("several implementations of ");
+                ty(interface, out);
+                out.push_str(" apply to ");
+                ty(t, out);
+            }
+            Self::OverlappingImpls { .. } => {
+                out.push_str("this implementation overlaps an earlier one");
+            }
+            Self::MissingMember { name: n, count } => {
+                out.push_str("missing interface member ");
+                name(Some(n), out);
+                if count > 1 {
+                    let _ = write!(out, " and {} more", count - 1);
+                }
+            }
+            Self::NotAMember { interface, name: n } => {
+                name(Some(n), out);
+                out.push_str(" is not a member of ");
+                ty(interface, out);
+            }
+            Self::InterfaceAsType => {
+                out.push_str("an interface is not a type here; write `dyn` or `impl` before it");
+            }
+            Self::ImplTraitPosition => {
+                out.push_str("`impl` types are allowed only in function parameters and results");
+            }
+            Self::MissingAssocBinding { name: n } => {
+                out.push_str("the associated type ");
+                name(Some(n), out);
+                out.push_str(" must be specified");
+            }
+            Self::RecursiveInstantiation => {
+                out.push_str("instantiating this generic item recurses without bound");
+            }
+            Self::TryCarrier { ty: t } => {
+                ty(t, out);
+                out.push_str(" cannot propagate a failure here");
+            }
             Self::Unsupported { feature } => {
                 let _ = write!(
                     out,
@@ -547,6 +723,8 @@ pub struct Diagnostic {
     pub node: NodeRef,
     /// The node's origin: source span and expansion.
     pub origin: Origin,
+    /// Error or warning.
+    pub severity: Severity,
 }
 
 #[cfg(test)]
@@ -613,8 +791,35 @@ mod tests {
             DiagnosticKind::NullableAccess { ty: t },
             DiagnosticKind::NonExhaustive { missing: None },
             DiagnosticKind::Unsupported {
-                feature: Feature::AssociatedTypes
+                feature: Feature::GenericAssocTypes
             },
+            DiagnosticKind::UnreachableArm,
+            DiagnosticKind::RedundantAlternative,
+            DiagnosticKind::NotAnInterface,
+            DiagnosticKind::GenericArity {
+                expected: 1,
+                found: 2
+            },
+            DiagnosticKind::NoAssocType { name: s },
+            DiagnosticKind::AmbiguousAssocType { name: s },
+            DiagnosticKind::Unsatisfied {
+                ty: t,
+                interface: t
+            },
+            DiagnosticKind::AmbiguousImpl {
+                ty: t,
+                interface: t
+            },
+            DiagnosticKind::MissingMember { name: s, count: 2 },
+            DiagnosticKind::NotAMember {
+                interface: t,
+                name: s
+            },
+            DiagnosticKind::InterfaceAsType,
+            DiagnosticKind::ImplTraitPosition,
+            DiagnosticKind::MissingAssocBinding { name: s },
+            DiagnosticKind::RecursiveInstantiation,
+            DiagnosticKind::TryCarrier { ty: t },
             DiagnosticKind::CyclicAlias,
             DiagnosticKind::InheritanceCycle,
             DiagnosticKind::NotConstant,
@@ -628,7 +833,10 @@ mod tests {
     fn test_codes_are_unique_and_messages_render() {
         let names = Interner::new();
         let types = Types::new();
-        let kinds = all_kinds();
+        let mut kinds = all_kinds();
+        kinds.extend(
+            hir_lang::ItemId::from_index(0).map(|other| DiagnosticKind::OverlappingImpls { other }),
+        );
         let mut codes: Vec<&str> = kinds.iter().map(DiagnosticKind::code).collect();
         codes.sort_unstable();
         let n = codes.len();
@@ -682,12 +890,7 @@ mod tests {
 
     #[test]
     fn test_feature_names() {
-        for f in [
-            Feature::Generics,
-            Feature::Traits,
-            Feature::AssociatedTypes,
-            Feature::StructuralImpls,
-        ] {
+        for f in [Feature::GenericAssocTypes, Feature::LongAssocPaths] {
             assert!(!f.name().is_empty());
         }
     }

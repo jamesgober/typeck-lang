@@ -2,11 +2,14 @@
 
 use alloc::{string::String, vec::Vec};
 
-use hir_lang::{BinderId, Def, ExprId, ItemId, PatId, PathId, Prim};
+use core::fmt::Write as _;
+
+use hir_lang::{BinderId, Def, ExprId, ItemId, PatId, PathId, Prim, Symbol, TyId, VariantId};
 use intern_lang::Lookup;
 
 use crate::{
-    diag::Diagnostic,
+    diag::{Diagnostic, DiagnosticKind, Severity},
+    mono::{Dispatch, Instantiation, MonoPlan},
     profile::Profile,
     types::{TypeDisplay, TypeId, Types},
 };
@@ -44,6 +47,16 @@ pub enum Coercion {
     AutoRef,
     /// A method receiver dereferenced automatically.
     AutoDeref,
+    /// A value used as a union containing its type.
+    ToUnion,
+    /// A value of an intersection type used as one of its members.
+    FromIntersection,
+    /// A value used as a `dyn` interface type (or a `dyn` type used as one
+    /// with fewer interfaces): lowering builds the vtable.
+    ToDyn,
+    /// A `?` failure converted to the enclosing function's failure type
+    /// through [`TryHook`](crate::TryHook)'s conversion interface.
+    ErrorConvert,
 }
 
 /// How an OPS operation was resolved by its operand types (HIR leaves this
@@ -101,6 +114,36 @@ pub struct Stats {
 
 pub(crate) const NONE: u32 = u32::MAX;
 
+/// One node of a stored witness (a value no arm matches), in preorder.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct WNode {
+    pub(crate) kind: WKind,
+    pub(crate) arity: u32,
+    /// Field names of a named-field record or variant: a range of
+    /// `Typed::wsyms`.
+    pub(crate) names: (u32, u32),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WKind {
+    Wild,
+    Null,
+    /// A present value of a nullable type.
+    Value,
+    /// A union member (matched by a type test).
+    Member(TypeId),
+    Variant(VariantId),
+    /// A record item's constructor.
+    Item(ItemId),
+    Tuple,
+    Ref,
+    Bool(bool),
+    Int(i128, i128),
+    Char(char, char),
+    Slice(u32),
+    SliceRest(u32, u32),
+}
+
 /// The result of checking one HIR unit.
 ///
 /// Every live expression, pattern, and bound binder has a type (dense side
@@ -144,7 +187,19 @@ pub struct Typed {
     pub(crate) methods: Vec<(ExprId, ItemId)>,
     pub(crate) coercions: Vec<(ExprId, Coercion, TypeId)>,
     pub(crate) op_classes: Vec<(ExprId, OpClass)>,
-    pub(crate) deferred: Vec<ExprId>,
+    /// Uses of generic items: (expression, item, args range, dispatch).
+    pub(crate) insts: Vec<(ExprId, ItemId, u32, u32, Dispatch)>,
+    pub(crate) inst_args: Vec<TypeId>,
+    pub(crate) mono: MonoPlan,
+    /// Hidden types of `impl Trait` results, by the `impl` type node.
+    pub(crate) opaque: Vec<(TyId, TypeId)>,
+    /// Witnesses of non-exhaustive matches: (match, node range).
+    pub(crate) witnesses: Vec<(ExprId, u32, u32)>,
+    pub(crate) wnodes: Vec<WNode>,
+    pub(crate) wsyms: Vec<Symbol>,
+    /// Names of variants and record items, for witnesses.
+    pub(crate) wnames: Vec<(u32, Symbol)>,
+    pub(crate) witems: Vec<(u32, Symbol)>,
     pub(crate) diagnostics: Vec<Diagnostic>,
     pub(crate) profile: Profile,
     pub(crate) stats: Stats,
@@ -302,7 +357,8 @@ impl Typed {
         &self.diagnostics
     }
 
-    /// `true` if no diagnostics were reported.
+    /// `true` if no error was reported (warnings, such as unreachable
+    /// `match` arms, do not count).
     ///
     /// # Examples
     ///
@@ -318,7 +374,9 @@ impl Typed {
     /// ```
     #[must_use]
     pub fn is_ok(&self) -> bool {
-        self.diagnostics.is_empty()
+        self.diagnostics
+            .iter()
+            .all(|d| d.severity != Severity::Error)
     }
 
     /// The definition the checker resolved a path's unresolved tail to
@@ -489,10 +547,95 @@ impl Typed {
         lookup(&self.op_classes, op)
     }
 
-    /// `match` expressions whose exhaustiveness depends on nested patterns:
-    /// the checker verified the top-level constructors and leaves the precise
-    /// answer to a pattern compiler (match-lang). Empty unless the profile
-    /// requires exhaustive matches.
+    /// The values a non-exhaustive `match` misses, as patterns (`Some(false)`,
+    /// `Shape::Rect { w: _, h: _ }`, `3..=9`), at most eight; empty when the
+    /// match is exhaustive or the profile does not require it.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use hir_lang::{Arm, Builder, Expr, Lit, Name, Pat};
+    /// use intern_lang::Interner;
+    /// use typeck_lang::{check, Profile};
+    ///
+    /// let mut names = Interner::new();
+    /// let mut b = Builder::new();
+    /// // fn main() { match true { true => {} } }
+    /// let scrutinee = b.lit(Lit::Bool(true));
+    /// let pat = b.pat(Pat::Lit(Lit::Bool(true)));
+    /// let body = b.block(&[], None);
+    /// let arms = b.list(&[Arm { pat, guard: None, body }]);
+    /// let m = b.expr(Expr::Match { scrutinee, arms });
+    /// let s = b.expr_stmt(m);
+    /// let main_body = b.block(&[s], None);
+    /// let main = b.func(Name::new(names.intern("main")), &[], main_body);
+    /// let root = b.module(None, &[main]);
+    /// let hir = b.finish(root)?;
+    ///
+    /// let typed = check(&hir, &Profile::static_explicit()).unwrap();
+    /// assert_eq!(typed.witnesses(m, &names), ["false"]);
+    /// assert_eq!(
+    ///     typed.message(&typed.diagnostics()[0], &names),
+    ///     "non-exhaustive match: `false` not covered",
+    /// );
+    /// # Ok::<(), hir_lang::HirError>(())
+    /// ```
+    #[must_use]
+    pub fn witnesses<L: Lookup>(&self, match_expr: ExprId, names: &L) -> Vec<String> {
+        let lo = self.witnesses.partition_point(|&(e, _, _)| e < match_expr);
+        self.witnesses
+            .get(lo..)
+            .unwrap_or(&[])
+            .iter()
+            .take_while(|&&(e, _, _)| e == match_expr)
+            .map(|&(_, start, len)| {
+                let nodes = self
+                    .wnodes
+                    .get(start as usize..(start as usize).saturating_add(len as usize))
+                    .unwrap_or(&[]);
+                let mut out = String::new();
+                self.render_witness(nodes, names, &mut out);
+                out
+            })
+            .collect()
+    }
+
+    /// The generic item an expression uses and its arguments: a path to a
+    /// generic function, a method call (also on non-generic methods, for
+    /// the dispatch), a constructor or literal of a generic type.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use hir_lang::{Builder, Name};
+    /// use intern_lang::Interner;
+    /// use typeck_lang::{check, Profile};
+    ///
+    /// let mut b = Builder::new();
+    /// let root = b.module(None, &[]);
+    /// let hir = b.finish(root)?;
+    /// let typed = check(&hir, &Profile::static_inferred()).unwrap();
+    /// let e = hir_lang::ExprId::from_index(0).unwrap();
+    /// assert!(typed.instantiation(e).is_none());
+    /// # Ok::<(), hir_lang::HirError>(())
+    /// ```
+    #[must_use]
+    pub fn instantiation(&self, expr: ExprId) -> Option<Instantiation<'_>> {
+        let i = self.insts.binary_search_by(|&(e, ..)| e.cmp(&expr)).ok()?;
+        let &(_, item, start, len, dispatch) = self.insts.get(i)?;
+        Some(Instantiation {
+            item,
+            args: self
+                .inst_args
+                .get(start as usize..(start as usize).saturating_add(len as usize))
+                .unwrap_or(&[]),
+            dispatch,
+        })
+    }
+
+    /// The monomorphization plan: every instance of a generic function the
+    /// program reaches, with how it is compiled (see
+    /// [`MonoPolicy`](crate::MonoPolicy)).
     ///
     /// # Examples
     ///
@@ -503,12 +646,34 @@ impl Typed {
     /// let mut b = Builder::new();
     /// let root = b.module(None, &[]);
     /// let hir = b.finish(root)?;
-    /// assert!(check(&hir, &Profile::static_explicit()).unwrap().deferred_matches().is_empty());
+    /// assert!(check(&hir, &Profile::static_inferred()).unwrap().mono_plan().is_empty());
     /// # Ok::<(), hir_lang::HirError>(())
     /// ```
     #[must_use]
-    pub fn deferred_matches(&self) -> &[ExprId] {
-        &self.deferred
+    pub fn mono_plan(&self) -> &MonoPlan {
+        &self.mono
+    }
+
+    /// The hidden type of a function's `impl Trait` result, named by the
+    /// `impl` type node of its return type (in the function's own
+    /// placeholders). Callers see only the bounds; lowering needs the type.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use hir_lang::{Builder, TyId};
+    /// use typeck_lang::{check, Profile};
+    ///
+    /// let mut b = Builder::new();
+    /// let root = b.module(None, &[]);
+    /// let hir = b.finish(root)?;
+    /// let typed = check(&hir, &Profile::static_inferred()).unwrap();
+    /// assert!(typed.opaque_type(TyId::from_index(0).unwrap()).is_none());
+    /// # Ok::<(), hir_lang::HirError>(())
+    /// ```
+    #[must_use]
+    pub fn opaque_type(&self, origin: TyId) -> Option<TypeId> {
+        lookup(&self.opaque, origin)
     }
 
     /// The profile the program was checked under.
@@ -607,6 +772,205 @@ impl Typed {
     pub fn message<L: Lookup>(&self, diagnostic: &Diagnostic, names: &L) -> String {
         let mut out = String::new();
         diagnostic.kind.render(&self.types, names, &mut out);
+        if let (DiagnosticKind::NonExhaustive { .. }, hir_lang::NodeRef::Expr(m)) =
+            (diagnostic.kind, diagnostic.node)
+        {
+            let ws = self.witnesses(m, names);
+            if let Some((first, rest)) = ws.split_first() {
+                let _ = write!(out, ": `{first}`");
+                match rest.len() {
+                    0 => out.push_str(" not covered"),
+                    1 => {
+                        let _ = write!(
+                            out,
+                            " and `{}` not covered",
+                            rest.first().map_or("", |s| s.as_str())
+                        );
+                    }
+                    n => {
+                        let _ = write!(out, " and {n} more not covered");
+                    }
+                }
+            }
+        }
         out
+    }
+
+    fn name_of(&self, key: u32) -> Option<Symbol> {
+        lookup(&self.wnames, key)
+    }
+
+    /// Renders one witness, iteratively: each node prints its head, then its
+    /// fields between brackets.
+    fn render_witness<L: Lookup>(&self, nodes: &[WNode], names: &L, out: &mut String) {
+        enum Piece {
+            Node(usize),
+            Text(&'static str),
+            Field(Symbol),
+        }
+        let push_sym = |s: Symbol, out: &mut String| {
+            if names.resolve_with(s, |t| out.push_str(t)).is_none() {
+                out.push('?');
+            }
+        };
+        // Subtree sizes (preorder: a node's fields follow it).
+        let mut size = alloc::vec![1usize; nodes.len()];
+        for i in (0..nodes.len()).rev() {
+            let arity = nodes.get(i).map_or(0, |n| n.arity as usize);
+            let mut child = i + 1;
+            let mut total = 1;
+            for _ in 0..arity {
+                let s = size.get(child).copied().unwrap_or(1);
+                total += s;
+                child += s;
+            }
+            if let Some(slot) = size.get_mut(i) {
+                *slot = total;
+            }
+        }
+        let mut stack = alloc::vec![Piece::Node(0)];
+        while let Some(piece) = stack.pop() {
+            if out.len() > 200 {
+                out.push('…');
+                return;
+            }
+            let i = match piece {
+                Piece::Text(t) => {
+                    out.push_str(t);
+                    continue;
+                }
+                Piece::Field(s) => {
+                    push_sym(s, out);
+                    out.push_str(": ");
+                    continue;
+                }
+                Piece::Node(i) => i,
+            };
+            let Some(n) = nodes.get(i).copied() else {
+                continue;
+            };
+            let mut kids = Vec::with_capacity(n.arity as usize);
+            let mut child = i + 1;
+            for _ in 0..n.arity {
+                kids.push(child);
+                child += size.get(child).copied().unwrap_or(1);
+            }
+            let fields: &[Symbol] = self
+                .wsyms
+                .get(n.names.0 as usize..(n.names.0 as usize).saturating_add(n.names.1 as usize))
+                .unwrap_or(&[]);
+            let named = !fields.is_empty() && fields.len() == kids.len();
+            let push_fields = |stack: &mut Vec<Piece>, open: &'static str, close: &'static str| {
+                stack.push(Piece::Text(close));
+                for (k, &c) in kids.iter().enumerate().rev() {
+                    stack.push(Piece::Node(c));
+                    if named {
+                        if let Some(&f) = fields.get(k) {
+                            stack.push(Piece::Field(f));
+                        }
+                    }
+                    if k > 0 {
+                        stack.push(Piece::Text(", "));
+                    }
+                }
+                stack.push(Piece::Text(open));
+            };
+            match n.kind {
+                WKind::Wild => out.push('_'),
+                WKind::Null => out.push_str("null"),
+                WKind::Value => {
+                    if let Some(&c) = kids.first() {
+                        stack.push(Piece::Node(c));
+                    }
+                }
+                WKind::Member(t) => {
+                    out.push_str("is ");
+                    self.types.render(t, names, out);
+                    if let Some(&c) = kids.first() {
+                        if nodes.get(c).is_some_and(|x| x.kind != WKind::Wild) {
+                            stack.push(Piece::Node(c));
+                            out.push(' ');
+                        }
+                    }
+                }
+                WKind::Variant(v) => {
+                    let key = u32::try_from(v.index()).unwrap_or(NONE);
+                    match self.name_of(key) {
+                        Some(s) => push_sym(s, out),
+                        None => {
+                            let _ = write!(out, "#{}", v.index());
+                        }
+                    }
+                    if !kids.is_empty() {
+                        if named {
+                            push_fields(&mut stack, " { ", " }");
+                        } else {
+                            push_fields(&mut stack, "(", ")");
+                        }
+                    }
+                }
+                WKind::Item(item) => {
+                    let key = u32::try_from(item.index()).unwrap_or(NONE);
+                    if let Some(s) = lookup(&self.witems, key) {
+                        push_sym(s, out);
+                    }
+                    if named {
+                        push_fields(&mut stack, " { ", " }");
+                    } else {
+                        push_fields(&mut stack, "(", ")");
+                    }
+                }
+                WKind::Tuple => {
+                    if named {
+                        push_fields(&mut stack, "{ ", " }");
+                    } else if kids.len() == 1 {
+                        push_fields(&mut stack, "(", ",)");
+                    } else {
+                        push_fields(&mut stack, "(", ")");
+                    }
+                }
+                WKind::Ref => {
+                    out.push('&');
+                    if let Some(&c) = kids.first() {
+                        stack.push(Piece::Node(c));
+                    }
+                }
+                WKind::Bool(b) => out.push_str(if b { "true" } else { "false" }),
+                WKind::Int(lo, hi) => {
+                    if lo == hi {
+                        let _ = write!(out, "{lo}");
+                    } else {
+                        let _ = write!(out, "{lo}..={hi}");
+                    }
+                }
+                WKind::Char(lo, hi) => {
+                    if lo == hi {
+                        let _ = write!(out, "{lo:?}");
+                    } else {
+                        let _ = write!(out, "{lo:?}..={hi:?}");
+                    }
+                }
+                WKind::Slice(_) => push_fields(&mut stack, "[", "]"),
+                WKind::SliceRest(prefix, _) => {
+                    // `[a, .., z]`: the elements with `..` at the rest.
+                    let mut seq: Vec<Piece> = alloc::vec![Piece::Text("[")];
+                    let total = kids.len() + 1;
+                    let mut k = 0usize;
+                    for pos in 0..total {
+                        if pos > 0 {
+                            seq.push(Piece::Text(", "));
+                        }
+                        if pos == prefix as usize {
+                            seq.push(Piece::Text(".."));
+                        } else if let Some(&c) = kids.get(k) {
+                            seq.push(Piece::Node(c));
+                            k += 1;
+                        }
+                    }
+                    seq.push(Piece::Text("]"));
+                    stack.extend(seq.into_iter().rev());
+                }
+            }
+        }
     }
 }

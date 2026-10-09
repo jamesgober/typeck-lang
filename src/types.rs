@@ -14,7 +14,7 @@
 use alloc::{string::String, vec::Vec};
 use core::fmt;
 
-use hir_lang::{BinderId, Def, DefId, Effects, ItemId, Prim, Symbol, UnitId, VariantId};
+use hir_lang::{BinderId, Def, DefId, Effects, ItemId, Prim, Symbol, TyId, UnitId, VariantId};
 use intern_lang::Lookup;
 
 /// A type in a [`Types`] store.
@@ -164,7 +164,7 @@ pub struct Field {
 
 /// A read-only view of one type node.
 ///
-/// `#[non_exhaustive]`: generics, traits, and the other profiles add forms.
+/// `#[non_exhaustive]`: later disciplines add forms.
 ///
 /// # Examples
 ///
@@ -198,6 +198,14 @@ pub enum Type<'a> {
         elem: TypeId,
         /// The length.
         len: u64,
+    },
+    /// An array whose length is not a known constant: a constant generic
+    /// parameter (`[T; N]` inside the item that declares `N`).
+    ParamArray {
+        /// The element type.
+        elem: TypeId,
+        /// The length: a [`Type::Param`] of a constant parameter.
+        len: TypeId,
     },
     /// A slice (an array of statically unknown length).
     Slice(TypeId),
@@ -235,16 +243,74 @@ pub enum Type<'a> {
     },
     /// An anonymous structural record, fields sorted by symbol.
     Record(&'a [Field]),
-    /// A nominal type declared in this unit: a record, sum, or class item.
-    Adt(ItemId),
-    /// A nominal type declared in another unit.
-    Foreign(DefId),
-    /// A host type named by an `Extern` resolution.
-    Extern(Symbol),
+    /// A nominal type declared in this unit (a record, sum, or class item),
+    /// with its generic arguments.
+    Adt {
+        /// The declaring item.
+        item: ItemId,
+        /// Generic arguments, in the order of the item's type and constant
+        /// parameters (region parameters are erased).
+        args: &'a [TypeId],
+    },
+    /// A nominal type declared in another unit, with its generic arguments.
+    Foreign {
+        /// The definition.
+        def: DefId,
+        /// Generic arguments.
+        args: &'a [TypeId],
+    },
+    /// A host type named by an `Extern` resolution, with its generic
+    /// arguments (`Vec<i32>`).
+    Extern {
+        /// The host symbol.
+        name: Symbol,
+        /// Generic arguments.
+        args: &'a [TypeId],
+    },
     /// A rigid generic parameter, inside the item that declares it.
     Param(BinderId),
+    /// An `impl Trait` parameter type (`fn f(x: impl Show)`): an anonymous
+    /// generic parameter, named by the HIR type node that declares it.
+    ImplParam(TyId),
     /// `Self` inside an interface: the implementing type, unknown here.
     SelfOf(ItemId),
+    /// A union `A | B` (members in canonical order, at least two, none a
+    /// union or nullable).
+    Union(&'a [TypeId]),
+    /// An intersection `A & B` (members in canonical order, at least two).
+    Intersection(&'a [TypeId]),
+    /// An interface (trait) applied to arguments, as it appears in a bound
+    /// or inside `dyn`.
+    Trait {
+        /// The interface item.
+        item: ItemId,
+        /// Its generic arguments; inside `dyn`, followed by the values of
+        /// its associated types in declaration order.
+        args: &'a [TypeId],
+    },
+    /// A trait object `dyn A + B`: any value whose type implements every
+    /// listed interface, dispatched at run time.
+    Dyn(&'a [TypeId]),
+    /// An associated type of a generic parameter that no bound fixes:
+    /// `<T as Iterator>::Item`.
+    Projection {
+        /// The interface declaring the associated type.
+        interface: ItemId,
+        /// The associated type item.
+        assoc: ItemId,
+        /// The self type, then the interface's arguments.
+        args: &'a [TypeId],
+    },
+    /// The opaque result of a function returning `impl Trait`, applied to
+    /// the function's generic arguments. Callers see only its bounds.
+    Opaque {
+        /// The `impl` type node of the function's return type.
+        origin: TyId,
+        /// The function's generic arguments.
+        args: &'a [TypeId],
+    },
+    /// A constant generic argument (`Buf<4>`).
+    Const(i64),
     /// The awaitable a call of an `ASYNC` function returns.
     Async(TypeId),
     /// The handle `spawn` returns; awaiting it yields the task's result.
@@ -280,7 +346,15 @@ pub(crate) enum Tag {
     Foreign,
     Extern,
     Param,
+    ImplParam,
     SelfOf,
+    Union,
+    Inter,
+    Trait,
+    Dyn,
+    Proj,
+    Opaque,
+    Const,
     Async,
     Task,
     Gen,
@@ -288,15 +362,59 @@ pub(crate) enum Tag {
     Var,
 }
 
+impl Tag {
+    /// Tags whose children are the pooled `kids` (and nothing else).
+    const fn pooled(self) -> bool {
+        matches!(
+            self,
+            Tag::Tuple
+                | Tag::Adt
+                | Tag::Foreign
+                | Tag::Extern
+                | Tag::Union
+                | Tag::Inter
+                | Tag::Trait
+                | Tag::Dyn
+                | Tag::Proj
+                | Tag::Opaque
+        )
+    }
+
+    /// Tags whose single child is stored in `x`.
+    const fn one_child(self) -> bool {
+        matches!(
+            self,
+            Tag::Slice
+                | Tag::Ref
+                | Tag::Ptr
+                | Tag::Nullable
+                | Tag::Async
+                | Tag::Task
+                | Tag::Gen
+                | Tag::AsyncGen
+        )
+    }
+
+    /// Placeholders: substituted when a generic item is instantiated.
+    pub(crate) const fn is_placeholder(self) -> bool {
+        matches!(self, Tag::Param | Tag::ImplParam | Tag::SelfOf)
+    }
+}
+
 /// One stored node. Scalars `x y z` are per-tag; `start`/`len` name a range of
-/// the children pool (`Tuple`, `Fn` params) or the field pool (`Record`).
+/// the children pool (pooled tags, `Fn` params) or the field pool (`Record`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Node {
     pub(crate) tag: Tag,
-    /// Prim code, mutability, effect bits, or variable class.
+    /// Prim code, mutability, effect bits, variable class, or array kind.
     pub(crate) small: u8,
     /// The node mentions an inference variable somewhere below it.
     pub(crate) has_var: bool,
+    /// The node mentions a placeholder (generic parameter, `impl`
+    /// parameter, interface `Self`) somewhere below it.
+    pub(crate) has_param: bool,
+    /// The node mentions a projection somewhere below it.
+    pub(crate) has_proj: bool,
     pub(crate) x: u32,
     pub(crate) y: u32,
     pub(crate) z: u32,
@@ -310,6 +428,8 @@ impl Node {
             tag,
             small: 0,
             has_var: false,
+            has_param: false,
+            has_proj: false,
             x: 0,
             y: 0,
             z: 0,
@@ -369,6 +489,10 @@ pub(crate) fn effects_from_bits(bits: u8) -> Effects {
     e
 }
 
+fn raw_of(index: usize) -> u32 {
+    u32::try_from(index).unwrap_or(u32::MAX)
+}
+
 /// The store of interned type terms.
 ///
 /// A [`Typed`](crate::Typed) result owns the store its side tables point into;
@@ -401,10 +525,11 @@ pub struct Types {
     table: Vec<u32>,
     /// Interned nodes in `table` (variables are never interned).
     interned: usize,
-    /// Display names of nominal items and generic parameters, by index
-    /// (`0` = unnamed). Not part of type identity.
+    /// Display names of nominal items, generic parameters, and `impl` type
+    /// nodes, by index (`0` = unnamed). Not part of type identity.
     item_names: Vec<u32>,
     binder_names: Vec<u32>,
+    impl_names: Vec<u32>,
 }
 
 fn set_name(names: &mut Vec<u32>, index: usize, name: Symbol) {
@@ -443,30 +568,15 @@ impl Types {
             interned: 0,
             item_names: Vec::new(),
             binder_names: Vec::new(),
+            impl_names: Vec::new(),
         };
         // The fixed ids, in order: ERROR ANY NEVER NULL UNIT, then the prims.
         for tag in [Tag::Error, Tag::Any, Tag::Never, Tag::Null] {
-            let _ = types.intern(Key {
-                tag,
-                small: 0,
-                x: 0,
-                y: 0,
-                z: 0,
-                kids: &[],
-                fields: &[],
-            });
+            let _ = types.simple(tag, 0, 0, 0, 0);
         }
         let _ = types.tuple(&[]);
         for p in PRIMS {
-            let _ = types.intern(Key {
-                tag: Tag::Prim,
-                small: prim_code(p),
-                x: 0,
-                y: 0,
-                z: 0,
-                kids: &[],
-                fields: &[],
-            });
+            let _ = types.simple(Tag::Prim, prim_code(p), 0, 0, 0);
         }
         types
     }
@@ -517,6 +627,9 @@ impl Types {
     }
 
     pub(crate) fn kids_of(&self, n: &Node) -> &[TypeId] {
+        if n.tag == Tag::Record {
+            return &[];
+        }
         let start = n.start as usize;
         self.kids
             .get(start..start.saturating_add(n.len as usize))
@@ -524,33 +637,34 @@ impl Types {
     }
 
     pub(crate) fn fields_of(&self, n: &Node) -> &[Field] {
+        if n.tag != Tag::Record {
+            return &[];
+        }
         let start = n.start as usize;
         self.fields
             .get(start..start.saturating_add(n.len as usize))
             .unwrap_or(&[])
     }
 
+    /// The pooled children of `id` (generic arguments, members, elements).
+    pub(crate) fn kids(&self, id: TypeId) -> &[TypeId] {
+        let n = self.node(id);
+        self.kids_of(&n)
+    }
+
     /// Calls `f` on every direct child of `id` (element, parameter, field,
-    /// inner type), in a fixed order.
+    /// argument, inner type), in a fixed order.
     pub(crate) fn for_each_child(&self, id: TypeId, mut f: impl FnMut(TypeId)) {
         let n = self.node(id);
         match n.tag {
-            Tag::Tuple => self.kids_of(&n).iter().for_each(|&k| f(k)),
+            t if t.pooled() => self.kids_of(&n).iter().for_each(|&k| f(k)),
             Tag::Fn => {
                 self.kids_of(&n).iter().for_each(|&k| f(k));
                 f(TypeId(n.z));
             }
             Tag::Record => self.fields_of(&n).iter().for_each(|fl| f(fl.ty)),
-            Tag::Array
-            | Tag::Slice
-            | Tag::Ref
-            | Tag::Ptr
-            | Tag::Nullable
-            | Tag::Async
-            | Tag::Task
-            | Tag::Gen
-            | Tag::AsyncGen => f(TypeId(n.x)),
-            Tag::Map => {
+            t if t.one_child() => f(TypeId(n.x)),
+            Tag::Map | Tag::Array => {
                 f(TypeId(n.x));
                 f(TypeId(n.y));
             }
@@ -573,6 +687,7 @@ impl Types {
     #[must_use]
     pub fn get(&self, id: TypeId) -> Type<'_> {
         let n = self.node(id);
+        let kids = || self.kids_of_ref(id);
         match n.tag {
             Tag::Error | Tag::Var => Type::Error,
             Tag::Any => Type::Any,
@@ -584,11 +699,21 @@ impl Types {
                     .copied()
                     .unwrap_or(Prim::Bool),
             ),
-            Tag::Tuple => Type::Tuple(self.kids_of_ref(id)),
-            Tag::Array => Type::Array {
-                elem: TypeId(n.x),
-                len: u64::from(n.y) | (u64::from(n.z) << 32),
-            },
+            Tag::Tuple => Type::Tuple(kids()),
+            Tag::Array => {
+                let len = self.node(TypeId(n.y));
+                if len.tag == Tag::Const {
+                    Type::Array {
+                        elem: TypeId(n.x),
+                        len: const_value(&len) as u64,
+                    }
+                } else {
+                    Type::ParamArray {
+                        elem: TypeId(n.x),
+                        len: TypeId(n.y),
+                    }
+                }
+            }
             Tag::Slice => Type::Slice(TypeId(n.x)),
             Tag::Ref => Type::Ref {
                 mutable: n.small != 0,
@@ -599,7 +724,7 @@ impl Types {
                 inner: TypeId(n.x),
             },
             Tag::Fn => Type::Fn {
-                params: self.kids_of_ref(id),
+                params: kids(),
                 ret: TypeId(n.z),
                 effects: effects_from_bits(n.small),
             },
@@ -609,11 +734,39 @@ impl Types {
                 value: TypeId(n.y),
             },
             Tag::Record => Type::Record(self.fields_of_ref(id)),
-            Tag::Adt => ItemId::from_index(n.x as usize).map_or(Type::Error, Type::Adt),
-            Tag::Foreign => foreign_def(&n).map_or(Type::Error, Type::Foreign),
-            Tag::Extern => Symbol::from_u32(n.x).map_or(Type::Error, Type::Extern),
+            Tag::Adt => ItemId::from_index(n.x as usize)
+                .map_or(Type::Error, |item| Type::Adt { item, args: kids() }),
+            Tag::Foreign => {
+                foreign_def(&n).map_or(Type::Error, |def| Type::Foreign { def, args: kids() })
+            }
+            Tag::Extern => Symbol::from_u32(n.x)
+                .map_or(Type::Error, |name| Type::Extern { name, args: kids() }),
             Tag::Param => BinderId::from_index(n.x as usize).map_or(Type::Error, Type::Param),
+            Tag::ImplParam => TyId::from_index(n.x as usize).map_or(Type::Error, Type::ImplParam),
             Tag::SelfOf => ItemId::from_index(n.x as usize).map_or(Type::Error, Type::SelfOf),
+            Tag::Union => Type::Union(kids()),
+            Tag::Inter => Type::Intersection(kids()),
+            Tag::Trait => ItemId::from_index(n.x as usize)
+                .map_or(Type::Error, |item| Type::Trait { item, args: kids() }),
+            Tag::Dyn => Type::Dyn(kids()),
+            Tag::Proj => match (
+                ItemId::from_index(n.x as usize),
+                ItemId::from_index(n.y as usize),
+            ) {
+                (Some(interface), Some(assoc)) => Type::Projection {
+                    interface,
+                    assoc,
+                    args: kids(),
+                },
+                _ => Type::Error,
+            },
+            Tag::Opaque => {
+                TyId::from_index(n.x as usize).map_or(Type::Error, |origin| Type::Opaque {
+                    origin,
+                    args: kids(),
+                })
+            }
+            Tag::Const => Type::Const(const_value(&n)),
             Tag::Async => Type::Async(TypeId(n.x)),
             Tag::Task => Type::Task(TypeId(n.x)),
             Tag::Gen => Type::Generator {
@@ -629,18 +782,12 @@ impl Types {
 
     fn kids_of_ref(&self, id: TypeId) -> &[TypeId] {
         let n = self.node(id);
-        let start = n.start as usize;
-        self.kids
-            .get(start..start.saturating_add(n.len as usize))
-            .unwrap_or(&[])
+        self.kids_of(&n)
     }
 
     fn fields_of_ref(&self, id: TypeId) -> &[Field] {
         let n = self.node(id);
-        let start = n.start as usize;
-        self.fields
-            .get(start..start.saturating_add(n.len as usize))
-            .unwrap_or(&[])
+        self.fields_of(&n)
     }
 
     // ----------------------------------------------------------- interning
@@ -710,9 +857,23 @@ impl Types {
     }
 
     fn push(&mut self, key: &Key<'_>) -> TypeId {
-        let has_var = key.kids.iter().any(|&k| self.node(k).has_var)
-            || key.fields.iter().any(|f| self.node(f.ty).has_var)
-            || self.scalar_children_have_var(key);
+        let mut has_var = key.tag == Tag::Var;
+        let mut has_param = key.tag.is_placeholder();
+        let mut has_proj = key.tag == Tag::Proj;
+        let mut note = |n: Node| {
+            has_var |= n.has_var;
+            has_param |= n.has_param;
+            has_proj |= n.has_proj;
+        };
+        for &k in key.kids {
+            note(self.node(k));
+        }
+        for f in key.fields {
+            note(self.node(f.ty));
+        }
+        for raw in self.scalar_children(key) {
+            note(self.node(TypeId(raw)));
+        }
         let (start, len) = if key.fields.is_empty() {
             let start = self.kids.len();
             self.kids.extend_from_slice(key.kids);
@@ -722,38 +883,32 @@ impl Types {
             self.fields.extend_from_slice(key.fields);
             (start, key.fields.len())
         };
-        let id = TypeId(u32::try_from(self.nodes.len()).unwrap_or(u32::MAX));
+        let id = TypeId(raw_of(self.nodes.len()));
         self.nodes.push(Node {
             tag: key.tag,
             small: key.small,
-            has_var: has_var || key.tag == Tag::Var,
+            has_var,
+            has_param,
+            has_proj,
             x: key.x,
             y: key.y,
             z: key.z,
-            start: u32::try_from(start).unwrap_or(u32::MAX),
+            start: raw_of(start),
             len: u32::try_from(len).unwrap_or(0),
         });
         id
     }
 
-    /// Whether the scalar-encoded children (`x`, `y`, `z` of the tags that
-    /// store type ids there) mention a variable.
-    fn scalar_children_have_var(&self, key: &Key<'_>) -> bool {
-        let var = |raw: u32| self.node(TypeId(raw)).has_var;
-        match key.tag {
-            Tag::Array
-            | Tag::Slice
-            | Tag::Ref
-            | Tag::Ptr
-            | Tag::Nullable
-            | Tag::Async
-            | Tag::Task
-            | Tag::Gen
-            | Tag::AsyncGen => var(key.x),
-            Tag::Map => var(key.x) || var(key.y),
-            Tag::Fn => var(key.z),
-            _ => false,
-        }
+    /// The scalar-encoded children (`x`, `y`, `z` of the tags that store
+    /// type ids there).
+    fn scalar_children(&self, key: &Key<'_>) -> impl Iterator<Item = u32> {
+        let (a, b) = match key.tag {
+            t if t.one_child() => (Some(key.x), None),
+            Tag::Map | Tag::Array => (Some(key.x), Some(key.y)),
+            Tag::Fn => (Some(key.z), None),
+            _ => (None, None),
+        };
+        a.into_iter().chain(b)
     }
 
     fn grow(&mut self) {
@@ -770,23 +925,15 @@ impl Types {
                 x: n.x,
                 y: n.y,
                 z: n.z,
-                kids: if n.tag == Tag::Record {
-                    &[]
-                } else {
-                    self.kids_of(n)
-                },
-                fields: if n.tag == Tag::Record {
-                    self.fields_of(n)
-                } else {
-                    &[]
-                },
+                kids: self.kids_of(n),
+                fields: self.fields_of(n),
             };
             let mut slot = (Self::hash(&key) as usize) & mask;
             while table.get(slot).is_some_and(|&s| s != EMPTY) {
                 slot = (slot + 1) & mask;
             }
             if let Some(s) = table.get_mut(slot) {
-                *s = u32::try_from(i).unwrap_or(u32::MAX);
+                *s = raw_of(i);
             }
         }
         self.table = table;
@@ -804,10 +951,22 @@ impl Types {
         })
     }
 
+    fn pooled(&mut self, tag: Tag, x: u32, y: u32, kids: &[TypeId]) -> TypeId {
+        self.intern(Key {
+            tag,
+            small: 0,
+            x,
+            y,
+            z: 0,
+            kids,
+            fields: &[],
+        })
+    }
+
     /// A fresh inference variable of the given class (never interned: each
     /// call is a distinct variable).
     pub(crate) fn fresh_var(&mut self, class: u8) -> TypeId {
-        let n = u32::try_from(self.nodes.len()).unwrap_or(u32::MAX);
+        let n = raw_of(self.nodes.len());
         self.push(&Key {
             tag: Tag::Var,
             small: class,
@@ -831,15 +990,7 @@ impl Types {
     /// assert_eq!(Types::new().tuple(&[]), TypeId::UNIT);
     /// ```
     pub fn tuple(&mut self, elems: &[TypeId]) -> TypeId {
-        self.intern(Key {
-            tag: Tag::Tuple,
-            small: 0,
-            x: 0,
-            y: 0,
-            z: 0,
-            kids: elems,
-            fields: &[],
-        })
+        self.pooled(Tag::Tuple, 0, 0, elems)
     }
 
     /// A fixed-length array type.
@@ -855,7 +1006,14 @@ impl Types {
     /// assert_eq!(types.get(a), Type::Array { elem: TypeId::prim(Prim::I32), len: 3 });
     /// ```
     pub fn array(&mut self, elem: TypeId, len: u64) -> TypeId {
-        self.simple(Tag::Array, 0, elem.0, len as u32, (len >> 32) as u32)
+        let len = self.constant(len as i64);
+        self.array_of(elem, len)
+    }
+
+    /// `[elem; len]` with the length as a type: a constant, a constant
+    /// parameter, or (while checking) a variable.
+    pub(crate) fn array_of(&mut self, elem: TypeId, len: TypeId) -> TypeId {
+        self.simple(Tag::Array, 0, elem.0, len.0, 0)
     }
 
     /// A slice type.
@@ -927,7 +1085,8 @@ impl Types {
         })
     }
 
-    /// `T?`. Nullable types do not nest: `nullable(T?)` is `T?`.
+    /// `T?`. Nullable types do not nest: `nullable(T?)` is `T?`, and
+    /// `nullable(null)` is `null`.
     ///
     /// # Examples
     ///
@@ -939,10 +1098,11 @@ impl Types {
     /// assert_eq!(types.nullable(once), once);
     /// ```
     pub fn nullable(&mut self, inner: TypeId) -> TypeId {
-        if self.node(inner).tag == Tag::Nullable {
-            return inner;
+        match self.node(inner).tag {
+            Tag::Nullable | Tag::Null | Tag::Error | Tag::Any => inner,
+            Tag::Never => TypeId::NULL,
+            _ => self.simple(Tag::Nullable, 0, inner.0, 0, 0),
         }
-        self.simple(Tag::Nullable, 0, inner.0, 0, 0)
     }
 
     /// A map type.
@@ -1002,7 +1162,8 @@ impl Types {
         })
     }
 
-    /// The nominal type of a record, sum, or class item of the checked unit.
+    /// The nominal type of a record, sum, or class item of the checked unit,
+    /// without generic arguments.
     ///
     /// # Examples
     ///
@@ -1013,16 +1174,30 @@ impl Types {
     /// let mut types = Types::new();
     /// let item = ItemId::from_index(3).unwrap();
     /// let t = types.adt(item);
-    /// assert_eq!(types.get(t), Type::Adt(item));
+    /// assert_eq!(types.get(t), Type::Adt { item, args: &[] });
     /// ```
     pub fn adt(&mut self, item: ItemId) -> TypeId {
-        self.simple(
-            Tag::Adt,
-            0,
-            u32::try_from(item.index()).unwrap_or(u32::MAX),
-            0,
-            0,
-        )
+        self.adt_with(item, &[])
+    }
+
+    /// The nominal type of a generic record, sum, or class item applied to
+    /// `args`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use typeck_lang::{Type, TypeId, Types};
+    /// use hir_lang::{ItemId, Prim};
+    ///
+    /// let mut types = Types::new();
+    /// let item = ItemId::from_index(3).unwrap();
+    /// let i32_ = TypeId::prim(Prim::I32);
+    /// let t = types.adt_with(item, &[i32_]);
+    /// assert_eq!(types.get(t), Type::Adt { item, args: &[i32_] });
+    /// assert_ne!(t, types.adt(item));
+    /// ```
+    pub fn adt_with(&mut self, item: ItemId, args: &[TypeId]) -> TypeId {
+        self.pooled(Tag::Adt, raw_of(item.index()), 0, args)
     }
 
     /// Remembers an item's name, for display of its nominal type.
@@ -1035,7 +1210,14 @@ impl Types {
         set_name(&mut self.binder_names, binder.index(), name);
     }
 
-    /// The nominal type of another unit's definition.
+    /// Remembers the interface an `impl Trait` type node names first, for
+    /// display.
+    pub(crate) fn name_impl(&mut self, ty: TyId, name: Symbol) {
+        set_name(&mut self.impl_names, ty.index(), name);
+    }
+
+    /// The nominal type of another unit's definition, without generic
+    /// arguments.
     ///
     /// # Examples
     ///
@@ -1046,23 +1228,44 @@ impl Types {
     /// let mut types = Types::new();
     /// let def = DefId::foreign(UnitId::new(2), Def::Item(ItemId::from_index(0).unwrap()));
     /// let t = types.foreign(def);
-    /// assert_eq!(types.get(t), Type::Foreign(def));
+    /// assert_eq!(types.get(t), Type::Foreign { def, args: &[] });
     /// ```
     pub fn foreign(&mut self, def: DefId) -> TypeId {
+        self.foreign_with(def, &[])
+    }
+
+    /// The nominal type of another unit's generic definition applied to
+    /// `args`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use typeck_lang::{Type, TypeId, Types};
+    /// use hir_lang::{Def, DefId, ItemId, UnitId};
+    ///
+    /// let mut types = Types::new();
+    /// let def = DefId::foreign(UnitId::new(2), Def::Item(ItemId::from_index(0).unwrap()));
+    /// let t = types.foreign_with(def, &[TypeId::UNIT]);
+    /// assert_eq!(types.get(t), Type::Foreign { def, args: &[TypeId::UNIT] });
+    /// ```
+    pub fn foreign_with(&mut self, def: DefId, args: &[TypeId]) -> TypeId {
         let (kind, index) = match def.def() {
             Def::Item(i) => (0, i.index()),
             Def::Variant(v) => (1, v.index()),
         };
-        self.simple(
-            Tag::Foreign,
-            kind,
-            def.unit().as_u32(),
-            u32::try_from(index).unwrap_or(u32::MAX),
-            0,
-        )
+        self.intern(Key {
+            tag: Tag::Foreign,
+            small: kind,
+            x: def.unit().as_u32(),
+            y: raw_of(index),
+            z: 0,
+            kids: args,
+            fields: &[],
+        })
     }
 
-    /// The nominal type of a host symbol (`Res::Extern`).
+    /// The nominal type of a host symbol (`Res::Extern`), without generic
+    /// arguments.
     ///
     /// # Examples
     ///
@@ -1074,30 +1277,164 @@ impl Types {
     /// let vec = names.intern("Vec");
     /// let mut types = Types::new();
     /// let t = types.external(vec);
-    /// assert_eq!(types.get(t), Type::Extern(vec));
+    /// assert_eq!(types.get(t), Type::Extern { name: vec, args: &[] });
     /// ```
     pub fn external(&mut self, name: Symbol) -> TypeId {
-        self.simple(Tag::Extern, 0, name.as_u32(), 0, 0)
+        self.external_with(name, &[])
+    }
+
+    /// A generic host type applied to `args` (`Vec<i32>`).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use typeck_lang::{Type, TypeId, Types};
+    /// use hir_lang::Prim;
+    /// use intern_lang::Interner;
+    ///
+    /// let mut names = Interner::new();
+    /// let vec = names.intern("Vec");
+    /// let mut types = Types::new();
+    /// let t = types.external_with(vec, &[TypeId::prim(Prim::I32)]);
+    /// assert_eq!(types.display(t, &names).to_string(), "Vec<i32>");
+    /// ```
+    pub fn external_with(&mut self, name: Symbol, args: &[TypeId]) -> TypeId {
+        self.pooled(Tag::Extern, name.as_u32(), 0, args)
     }
 
     pub(crate) fn param(&mut self, binder: BinderId) -> TypeId {
-        self.simple(
-            Tag::Param,
-            0,
-            u32::try_from(binder.index()).unwrap_or(u32::MAX),
-            0,
-            0,
-        )
+        self.simple(Tag::Param, 0, raw_of(binder.index()), 0, 0)
+    }
+
+    pub(crate) fn impl_param(&mut self, ty: TyId) -> TypeId {
+        self.simple(Tag::ImplParam, 0, raw_of(ty.index()), 0, 0)
     }
 
     pub(crate) fn self_of(&mut self, item: ItemId) -> TypeId {
-        self.simple(
-            Tag::SelfOf,
-            0,
-            u32::try_from(item.index()).unwrap_or(u32::MAX),
-            0,
-            0,
+        self.simple(Tag::SelfOf, 0, raw_of(item.index()), 0, 0)
+    }
+
+    pub(crate) fn trait_ref(&mut self, item: ItemId, args: &[TypeId]) -> TypeId {
+        self.pooled(Tag::Trait, raw_of(item.index()), 0, args)
+    }
+
+    /// `dyn A + B` over trait nodes, sorted and deduplicated.
+    pub(crate) fn dyn_of(&mut self, traits: &[TypeId]) -> TypeId {
+        let mut sorted = traits.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        self.pooled(Tag::Dyn, 0, 0, &sorted)
+    }
+
+    /// `<args[0] as interface<args[1..]>>::assoc`.
+    pub(crate) fn projection(
+        &mut self,
+        interface: ItemId,
+        assoc: ItemId,
+        args: &[TypeId],
+    ) -> TypeId {
+        self.pooled(
+            Tag::Proj,
+            raw_of(interface.index()),
+            raw_of(assoc.index()),
+            args,
         )
+    }
+
+    pub(crate) fn opaque(&mut self, origin: TyId, args: &[TypeId]) -> TypeId {
+        self.pooled(Tag::Opaque, raw_of(origin.index()), 0, args)
+    }
+
+    pub(crate) fn constant(&mut self, value: i64) -> TypeId {
+        let bits = value as u64;
+        self.simple(Tag::Const, 0, bits as u32, (bits >> 32) as u32, 0)
+    }
+
+    /// A union of `members`, in canonical form: nested unions are
+    /// flattened, `null` and nullable members make the whole union nullable
+    /// (`A | B | null` is `(A | B)?`), members are sorted by id and
+    /// deduplicated, a single member is itself, `!` members vanish (an empty
+    /// union is `!`), and `any` or `{error}` absorb the union.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use typeck_lang::{Type, TypeId, Types};
+    /// use hir_lang::Prim;
+    ///
+    /// let mut types = Types::new();
+    /// let (i, s) = (TypeId::prim(Prim::I64), TypeId::prim(Prim::Str));
+    /// let a = types.union(&[s, i]);
+    /// assert_eq!(a, types.union(&[i, s, i]));
+    /// assert!(matches!(types.get(a), Type::Union(&[_, _])));
+    /// let n = types.union(&[i, TypeId::NULL]);
+    /// assert_eq!(n, types.nullable(i));
+    /// ```
+    pub fn union(&mut self, members: &[TypeId]) -> TypeId {
+        let mut flat: Vec<TypeId> = Vec::with_capacity(members.len());
+        let mut nullable = false;
+        for &m in members {
+            let n = self.node(m);
+            match n.tag {
+                Tag::Error | Tag::Any => return m,
+                Tag::Never => {}
+                Tag::Null => nullable = true,
+                Tag::Nullable => {
+                    nullable = true;
+                    let inner = TypeId(n.x);
+                    match self.node(inner).tag {
+                        Tag::Union => flat.extend_from_slice(self.kids(inner)),
+                        _ => flat.push(inner),
+                    }
+                }
+                Tag::Union => flat.extend_from_slice(self.kids_of(&n)),
+                _ => flat.push(m),
+            }
+        }
+        flat.sort_unstable();
+        flat.dedup();
+        let body = match flat.as_slice() {
+            [] => TypeId::NEVER,
+            [one] => *one,
+            _ => self.pooled(Tag::Union, 0, 0, &flat),
+        };
+        if nullable { self.nullable(body) } else { body }
+    }
+
+    /// An intersection of `members`, in canonical form: nested intersections
+    /// are flattened, members sorted by id and deduplicated, a single member
+    /// is itself, and `!` or `{error}` absorb it.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use typeck_lang::{Type, TypeId, Types};
+    /// use hir_lang::ItemId;
+    ///
+    /// let mut types = Types::new();
+    /// let a = types.adt(ItemId::from_index(1).unwrap());
+    /// let b = types.adt(ItemId::from_index(2).unwrap());
+    /// let ab = types.intersection(&[b, a]);
+    /// assert_eq!(types.get(ab), Type::Intersection(&[a, b]));
+    /// assert_eq!(types.intersection(&[a]), a);
+    /// ```
+    pub fn intersection(&mut self, members: &[TypeId]) -> TypeId {
+        let mut flat: Vec<TypeId> = Vec::with_capacity(members.len());
+        for &m in members {
+            let n = self.node(m);
+            match n.tag {
+                Tag::Error | Tag::Never => return m,
+                Tag::Inter => flat.extend_from_slice(self.kids_of(&n)),
+                _ => flat.push(m),
+            }
+        }
+        flat.sort_unstable();
+        flat.dedup();
+        match flat.as_slice() {
+            [] => TypeId::ANY,
+            [one] => *one,
+            _ => self.pooled(Tag::Inter, 0, 0, &flat),
+        }
     }
 
     /// The awaitable a call of an `ASYNC` function returns.
@@ -1146,14 +1483,25 @@ impl Types {
         self.simple(tag, 0, item.0, 0, 0)
     }
 
-    /// Rebuilds node `id` with new children (same tag and scalars). Used by
-    /// zonking; `kids` replaces the pooled or scalar children in
-    /// `for_each_child` order.
+    /// Rebuilds node `id` with new children (same tag and scalars), in
+    /// `for_each_child` order. Used by zonking and substitution; unions and
+    /// intersections are brought back into canonical form.
     pub(crate) fn rebuild(&mut self, id: TypeId, kids: &[TypeId]) -> TypeId {
         let n = self.node(id);
         let first = |i: usize| kids.get(i).copied().unwrap_or(TypeId::ERROR);
         match n.tag {
-            Tag::Tuple => self.tuple(kids),
+            Tag::Union => self.union(kids),
+            Tag::Inter => self.intersection(kids),
+            Tag::Dyn => self.dyn_of(kids),
+            t if t.pooled() => self.intern(Key {
+                tag: t,
+                small: n.small,
+                x: n.x,
+                y: n.y,
+                z: n.z,
+                kids,
+                fields: &[],
+            }),
             Tag::Fn => {
                 let (params, ret) = kids.split_at(kids.len().saturating_sub(1));
                 let ret = ret.first().copied().unwrap_or(TypeId::ERROR);
@@ -1176,16 +1524,10 @@ impl Types {
                     .collect();
                 self.record_sorted(&fields)
             }
-            Tag::Array => self.simple(Tag::Array, 0, first(0).0, n.y, n.z),
+            Tag::Array => self.array_of(first(0), first(1)),
             Tag::Nullable => self.nullable(first(0)),
             Tag::Map => self.map(first(0), first(1)),
-            Tag::Slice
-            | Tag::Ref
-            | Tag::Ptr
-            | Tag::Async
-            | Tag::Task
-            | Tag::Gen
-            | Tag::AsyncGen => self.simple(n.tag, n.small, first(0).0, 0, 0),
+            t if t.one_child() => self.simple(t, n.small, first(0).0, 0, 0),
             _ => id,
         }
     }
@@ -1222,6 +1564,10 @@ impl Types {
     pub(crate) fn render<L: Lookup>(&self, id: TypeId, names: &L, out: &mut String) {
         render(self, id, names, out);
     }
+}
+
+fn const_value(n: &Node) -> i64 {
+    (u64::from(n.x) | (u64::from(n.y) << 32)) as i64
 }
 
 fn foreign_def(n: &Node) -> Option<DefId> {
@@ -1268,6 +1614,7 @@ enum Piece {
     Text(&'static str),
     Name(u32),
     Len(u64),
+    Signed(i64),
 }
 
 fn push_name<L: Lookup>(names: &L, raw: u32, out: &mut String) {
@@ -1300,6 +1647,43 @@ fn push_u64(mut v: u64, out: &mut String) {
     }
 }
 
+/// Pushes a display name from `table` (or `fallback#index`).
+fn push_table_name<L: Lookup>(
+    table: &[u32],
+    index: u32,
+    fallback: &str,
+    names: &L,
+    out: &mut String,
+) {
+    match table.get(index as usize).copied().filter(|&raw| raw != 0) {
+        Some(raw) => push_name(names, raw, out),
+        None => {
+            out.push_str(fallback);
+            push_u64(u64::from(index), out);
+        }
+    }
+}
+
+/// Pushes `items` separated by `sep`, in reverse so they pop in order.
+fn push_seq(stack: &mut Vec<Piece>, items: &[TypeId], sep: &'static str) {
+    for (i, &k) in items.iter().enumerate().rev() {
+        stack.push(Piece::Ty(k));
+        if i > 0 {
+            stack.push(Piece::Text(sep));
+        }
+    }
+}
+
+/// Pushes `<args>` (nothing when empty).
+fn push_args(stack: &mut Vec<Piece>, args: &[TypeId]) {
+    if !args.is_empty() {
+        stack.push(Piece::Text(">"));
+        push_seq(stack, args, ", ");
+        stack.push(Piece::Text("<"));
+    }
+}
+
+#[allow(clippy::too_many_lines)]
 fn render<L: Lookup>(types: &Types, id: TypeId, names: &L, out: &mut String) {
     let mut stack = alloc::vec![Piece::Ty(id)];
     while let Some(piece) = stack.pop() {
@@ -1320,24 +1704,17 @@ fn render<L: Lookup>(types: &Types, id: TypeId, names: &L, out: &mut String) {
                 push_u64(len, out);
                 continue;
             }
+            Piece::Signed(v) => {
+                if v < 0 {
+                    out.push('-');
+                }
+                push_u64(v.unsigned_abs(), out);
+                continue;
+            }
             Piece::Ty(id) => id,
         };
         let n = types.node(id);
-        // Children are pushed in reverse so they pop in order.
-        let seq =
-            |open: &'static str, items: &[TypeId], close: &'static str, stack: &mut Vec<Piece>| {
-                stack.push(Piece::Text(close));
-                if items.len() == 1 && open == "(" {
-                    stack.push(Piece::Text(","));
-                }
-                for (i, &k) in items.iter().enumerate().rev() {
-                    stack.push(Piece::Ty(k));
-                    if i > 0 {
-                        stack.push(Piece::Text(", "));
-                    }
-                }
-                stack.push(Piece::Text(open));
-            };
+        let kids = types.kids_of(&n);
         match n.tag {
             Tag::Error => out.push_str("{error}"),
             Tag::Var => out.push_str(match n.small {
@@ -1355,10 +1732,22 @@ fn render<L: Lookup>(types: &Types, id: TypeId, names: &L, out: &mut String) {
                     .unwrap_or(Prim::Bool)
                     .name(),
             ),
-            Tag::Tuple => seq("(", types.kids_of(&n), ")", &mut stack),
+            Tag::Tuple => {
+                stack.push(Piece::Text(")"));
+                if kids.len() == 1 {
+                    stack.push(Piece::Text(","));
+                }
+                push_seq(&mut stack, kids, ", ");
+                stack.push(Piece::Text("("));
+            }
             Tag::Array => {
                 stack.push(Piece::Text("]"));
-                stack.push(Piece::Len(u64::from(n.y) | (u64::from(n.z) << 32)));
+                let len = types.node(TypeId(n.y));
+                if len.tag == Tag::Const {
+                    stack.push(Piece::Len(const_value(&len) as u64));
+                } else {
+                    stack.push(Piece::Ty(TypeId(n.y)));
+                }
                 stack.push(Piece::Text("; "));
                 stack.push(Piece::Ty(TypeId(n.x)));
                 stack.push(Piece::Text("["));
@@ -1379,15 +1768,24 @@ fn render<L: Lookup>(types: &Types, id: TypeId, names: &L, out: &mut String) {
             }
             Tag::Fn => {
                 stack.push(Piece::Ty(TypeId(n.z)));
-                stack.push(Piece::Text(" -> "));
-                seq("fn(", types.kids_of(&n), ")", &mut stack);
+                stack.push(Piece::Text(") -> "));
+                push_seq(&mut stack, kids, ", ");
+                stack.push(Piece::Text("fn("));
                 if n.small & 0b10 != 0 {
                     stack.push(Piece::Text("async "));
                 }
             }
             Tag::Nullable => {
                 stack.push(Piece::Text("?"));
-                stack.push(Piece::Ty(TypeId(n.x)));
+                let inner = TypeId(n.x);
+                let compound = matches!(types.node(inner).tag, Tag::Union | Tag::Inter | Tag::Fn);
+                if compound {
+                    stack.push(Piece::Text(")"));
+                }
+                stack.push(Piece::Ty(inner));
+                if compound {
+                    stack.push(Piece::Text("("));
+                }
             }
             Tag::Map => {
                 stack.push(Piece::Text("}"));
@@ -1409,28 +1807,58 @@ fn render<L: Lookup>(types: &Types, id: TypeId, names: &L, out: &mut String) {
                 }
                 stack.push(Piece::Text("{ "));
             }
-            Tag::Adt | Tag::Param => {
-                let table = if n.tag == Tag::Adt {
-                    &types.item_names
-                } else {
-                    &types.binder_names
-                };
-                match table.get(n.x as usize).copied().filter(|&raw| raw != 0) {
-                    Some(raw) => push_name(names, raw, out),
-                    None => {
-                        out.push_str(if n.tag == Tag::Adt { "item#" } else { "param#" });
-                        push_u64(u64::from(n.x), out);
-                    }
-                }
+            Tag::Adt => {
+                push_args(&mut stack, kids);
+                push_table_name(&types.item_names, n.x, "item#", names, out);
+            }
+            Tag::Trait => {
+                // Inside `dyn`, the associated-type values follow the
+                // arguments; they are shown as arguments too.
+                push_args(&mut stack, kids);
+                push_table_name(&types.item_names, n.x, "item#", names, out);
+            }
+            Tag::Param => push_table_name(&types.binder_names, n.x, "param#", names, out),
+            Tag::ImplParam => {
+                out.push_str("impl ");
+                push_table_name(&types.impl_names, n.x, "#", names, out);
+            }
+            Tag::Opaque => {
+                out.push_str("impl ");
+                push_table_name(&types.impl_names, n.x, "#", names, out);
             }
             Tag::Foreign => {
+                push_args(&mut stack, kids);
                 out.push('u');
                 push_u64(u64::from(n.x), out);
                 out.push_str(if n.small == 0 { ":item#" } else { ":variant#" });
                 push_u64(u64::from(n.y), out);
             }
-            Tag::Extern => push_name(names, n.x, out),
+            Tag::Extern => {
+                push_args(&mut stack, kids);
+                push_name(names, n.x, out);
+            }
             Tag::SelfOf => out.push_str("Self"),
+            Tag::Union => push_seq(&mut stack, kids, " | "),
+            Tag::Inter => push_seq(&mut stack, kids, " & "),
+            Tag::Dyn => {
+                push_seq(&mut stack, kids, " + ");
+                stack.push(Piece::Text("dyn "));
+            }
+            Tag::Proj => {
+                // `<T as Tr<A>>::Item`
+                stack.push(Piece::Name(
+                    types.item_names.get(n.y as usize).copied().unwrap_or(0),
+                ));
+                stack.push(Piece::Text(">::"));
+                push_args(&mut stack, kids.get(1..).unwrap_or(&[]));
+                stack.push(Piece::Name(
+                    types.item_names.get(n.x as usize).copied().unwrap_or(0),
+                ));
+                stack.push(Piece::Text(" as "));
+                stack.push(Piece::Ty(kids.first().copied().unwrap_or(TypeId::ERROR)));
+                stack.push(Piece::Text("<"));
+            }
+            Tag::Const => stack.push(Piece::Signed(const_value(&n))),
             Tag::Async | Tag::Task | Tag::Gen | Tag::AsyncGen => {
                 stack.push(Piece::Text(">"));
                 stack.push(Piece::Ty(TypeId(n.x)));
@@ -1544,10 +1972,17 @@ mod tests {
         let mut t = Types::new();
         let it = item(7);
         let a = t.adt(it);
+        assert_eq!(
+            t.get(a),
+            Type::Adt {
+                item: it,
+                args: &[]
+            }
+        );
         assert_eq!(a, t.adt(it));
         let def = DefId::foreign(UnitId::new(3), Def::Item(it));
         let f = t.foreign(def);
-        assert_eq!(t.get(f), Type::Foreign(def));
+        assert_eq!(t.get(f), Type::Foreign { def, args: &[] });
         let v = VariantId::from_index(2)
             .map(Def::Variant)
             .unwrap_or(Def::Item(it));
@@ -1598,6 +2033,7 @@ mod tests {
             (t.map(i32_, i32_), "{i32: i32}"),
             (t.record(&[Field { name: x, ty: i32_ }]), "{ x: i32 }"),
             (t.external(vec), "Vec"),
+            (t.external_with(vec, &[i32_]), "Vec<i32>"),
             (t.awaitable(i32_), "async<i32>"),
             (t.task(i32_), "task<i32>"),
             (t.generator(i32_, false), "generator<i32>"),
@@ -1610,6 +2046,40 @@ mod tests {
         assert_eq!(t.display(adt, &names).to_string(), "item#4");
         t.name_item(it, x);
         assert_eq!(t.display(adt, &names).to_string(), "x");
+        let args = t.adt_with(it, &[i32_, TypeId::UNIT]);
+        assert_eq!(t.display(args, &names).to_string(), "x<i32, ()>");
+        let u = t.union(&[i32_, TypeId::prim(Prim::Str)]);
+        assert_eq!(t.display(u, &names).to_string(), "i32 | str");
+        let nu = t.nullable(u);
+        assert_eq!(t.display(nu, &names).to_string(), "(i32 | str)?");
+        let k = t.constant(-4);
+        assert_eq!(t.display(k, &names).to_string(), "-4");
+    }
+
+    #[test]
+    fn test_union_canonical_form() {
+        let mut t = Types::new();
+        let (a, b, c) = (
+            TypeId::prim(Prim::I32),
+            TypeId::prim(Prim::Str),
+            TypeId::prim(Prim::Bool),
+        );
+        let ab = t.union(&[b, a]);
+        let abc = t.union(&[ab, c]);
+        assert_eq!(abc, t.union(&[c, b, a, a]));
+        assert_eq!(t.union(&[a]), a);
+        assert_eq!(t.union(&[]), TypeId::NEVER);
+        assert_eq!(t.union(&[TypeId::NEVER, a]), a);
+        assert_eq!(t.union(&[a, TypeId::ANY]), TypeId::ANY);
+        let na = t.nullable(a);
+        let n = t.union(&[na, b]);
+        let ab2 = t.union(&[a, b]);
+        assert_eq!(t.get(n), Type::Nullable(ab2));
+        assert_eq!(t.union(&[TypeId::NULL]), TypeId::NULL);
+        let i1 = t.intersection(&[a, b]);
+        let i2 = t.intersection(&[i1, c]);
+        assert_eq!(i2, t.intersection(&[c, b, a]));
+        assert_eq!(t.intersection(&[a, TypeId::NEVER]), TypeId::NEVER);
     }
 
     #[test]

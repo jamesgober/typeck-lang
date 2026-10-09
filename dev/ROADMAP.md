@@ -99,10 +99,13 @@ Dependency wiring (decided here, recorded per the anti-deferral rule):
     breaking change for typeck-lang's users.
 - **resolve-lang, match-lang: not wired.** typeck consumes resolutions already in the HIR and
   defers precise exhaustiveness to match-lang through `Typed::deferred_matches`; the
-  LexerSketch app connects them (single responsibility).
+  LexerSketch app connects them (single responsibility). *(Superseded in v0.3.0: match-lang is
+  wired and decides exhaustiveness; `deferred_matches` is gone. resolve-lang stays unwired.)*
 
-Moved to v0.5.0 (anti-deferral record). Each is reported as `Unsupported` (or the 0.5
-disciplines return `CheckError::NotImplemented`) rather than guessed:
+Moved to v0.5.0 (anti-deferral record; **all of these except the `gradual` and `hm`
+disciplines were then brought forward and delivered in v0.3.0**, below). Each was reported as
+`Unsupported` (or the 0.5 disciplines returned `CheckError::NotImplemented`) rather than
+guessed:
 - **Generic items and generic arguments** (`Feature::Generics`). Instantiation needs the
   bound language (traits/interfaces) to type anything useful inside generic bodies; designing
   instantiation without bounds would be redone in 0.5. Inside a generic item its parameters are
@@ -122,9 +125,107 @@ visibility (resolve-lang), precise exhaustiveness and usefulness (match-lang), m
 ownership, and borrowing (capabilities over typed HIR, borrow-cc), mixin expansion (resolve-lang
 expands `MixinUse`; until then member lookups on classes using mixins stay silent).
 
+## v0.3.0 - Static-inferred (DONE)
+- [x] Upgrade to hir-lang 0.4 (HIR spec v3): unions and intersections in the static profiles; `let_place`, keyed `yield`, `yield from`, `bit_not`, `pow`.
+- [x] The `static-inferred` profile: bidirectional checking with local inference; generic functions and types with bounds and where clauses; interfaces (traits) with methods, associated types, and default methods; impl blocks, generic ones indexed (P17); interface method resolution with auto-ref as a profile toggle; closures with inferred signatures; `?` typing through a profile hook; a monomorphization plan with a selective policy (LANGUAGES.md, Iron). Coherence (overlap) and conformance, with ambiguity errors.
+- [x] Exhaustiveness through match-lang (P17): a `Model` over the checker's types; missing witnesses and unreachable arms as typed diagnostics.
+- [x] The P17 conventions: `let x = null` is a profile toggle (`null_let`); the generator, assignment, and `?` conventions are recorded in `specs/HIR.md` §8.11.
+- [x] Union-find termination guarantees and budgets kept; adversarial inference tests (deep generics, recursive bounds, resolution cycles are budget errors, not hangs).
+
+Exit criteria:
+- [x] Every public item has rustdoc and a runnable example; README and `docs/API.md` code blocks run as doctests.
+- [x] Property tests extend the typed generator to generics and interfaces with exact expected types, dispatch, and plan instances; single-mutation and error-node properties hold for generic programs.
+- [x] A corpus of Kraken-like hand-built programs checks with exact types, dispatch, plans, and diagnostics.
+- [x] Benchmarks at 100k and 1M nodes for `static-inferred`, including generic-heavy programs; linear in program size.
+
+Delivered:
+- **Generics**: placeholders per item (owner's first, then own, then `impl Trait`
+  parameters), read from the HIR alone so lowering a type never needs bounds;
+  instantiation by memoized substitution (placeholder-free subterms skipped, var-bound
+  structure followed); explicit, defaulted, and inferred arguments; constant parameters and
+  arguments (`Type::Const`, `Type::ParamArray`); generic aliases; bounds and where clauses
+  lowered once per item in two passes (plain parameters first, so `T: Iterator, T::Item:
+  Show` works in either order); bounds checked at instantiation, at construction, and in
+  written annotations (in the annotation's scope); `impl Trait` parameters as anonymous
+  generics and results as opaque types with recorded hidden types.
+- **Interfaces**: implementation records (impl blocks and classes' declared interfaces)
+  indexed by self-type head with a blanket bucket; selection by unification in rolled-back
+  snapshots; a goal queue (`T: I`, `<T as I>::A == U`) solved where possible, at item ends
+  after literal defaults, and reported as `CannotInfer` if still open; supertrait
+  elaboration with a visited set; associated-type normalization (implementation alias,
+  interface default, binding in scope, rigid projection, or a variable with a goal); member
+  lookup through bounds, `dyn`, inherent members (base classes walked level by level), host
+  members, and implementations (an implementation's member overrides the interface's
+  default); `T::f`, `I::f`, `<T as I>::f`; coherence (pairwise overlap within a head bucket
+  and against blanket impls) and conformance (missing, extra, mistyped members).
+- **Bidirectional checking**: expected results probed into generic calls' arguments;
+  expected instances unified into record literals; closures typed from expected function
+  types (`static-inferred`); pending goals solved before structural reads.
+- **Exhaustiveness** through match-lang 0.2 with a `Model` over checker types (generic sums'
+  fields substituted on demand), patterns translated iteratively (inexpressible patterns
+  count as guarded), witnesses stored and rendered with names, warnings with severity.
+- **Monomorphization plan**: a breadth-first closure over (item, arguments) from the
+  non-generic code, with bound calls resolved per instance, `dyn` coercions adding vtables,
+  shared items walked once with their placeholders plus their dictionaries' methods per
+  concrete call site, and a depth cap reporting polymorphic recursion.
+- **Profiles**: `method_autoref`, `mono` (`MonoPolicy`), `null_let` (`NullLet`), `try_hook`
+  (`TryHook`); `Discipline::StaticInferred` implemented.
+- **Soundness fixes found while building it**: error containment through generic structure
+  (unifying `{error}` binds the other side's variables); class representatives prefer
+  variable-free terms; walks gated by node flags also follow variable bindings.
+
+How the invariants are tested (in addition to v0.2.0's):
+- *Never panics, always terminates*: `tests/arbitrary.rs` now builds generics, interfaces,
+  impls (generic, blanket), `dyn`, `impl Trait`, unions, intersections, `let_place`, keyed
+  yields, `yield from`, `bit_not`, `pow`, ranges and or-patterns, and `?` intrinsics, and
+  checks totality and determinism under five profiles (a cyclic resolution such as a
+  self-requiring blanket impl may be a deterministic `TraitDepth` budget error) and any step
+  budget under two (also run at 60,000 cases); `tests/adversarial_generics.rs`
+  (30,000-deep generic arguments, 50,000 nested generic calls, self-requiring and
+  ever-growing impls, trait-depth budget honoured, supertrait cycles, cyclic generic aliases,
+  defaults, and associated types, the last two on a 1 MiB stack).
+- *Every expression typed; one root cause, one diagnostic*: `tests/properties_generic.rs`
+  (exact types including generic arguments, exact method targets including generic impls and
+  default methods, exact plan instances; single-mutation blame through generic calls by
+  checking mode; error nodes contained; determinism; a coverage test; also run at 20,000
+  cases).
+- *Profiles sound for what they claim*: rule tests `tests/inferred.rs`, `tests/traits.rs`,
+  `tests/generics.rs`, `tests/exhaustive.rs`, `tests/mono.rs`, and the corpus
+  `tests/kraken_corpus.rs`.
+- *Shared structure never expanded / linear work*: step counts at 10k vs 20k nested generic
+  calls and 2k vs 4k implementations; benchmarks at 100k and 1M nodes.
+
+Dependency wiring (decided here, recorded per the anti-deferral rule):
+- **hir-lang 0.4: wired** (was 0.3): HIR spec v3.
+- **match-lang 0.2: wired.** Exhaustiveness and usefulness; typeck implements its `Model`.
+  (0.2.0 had left precise exhaustiveness to the app; P17 asked typeck to decide it.)
+- **intern-lang 1: wired** (unchanged).
+- **type-lang: still not wired**, for the reasons recorded under v0.2.0 (M39-M41); the store
+  now also carries generic arguments, projections, opaque types, unions, and trait objects.
+
+Not in 0.3.0, recorded per the anti-deferral rule (none is part of this milestone's scope;
+each is reported, never guessed):
+- **The `gradual` and `hm` disciplines**: v0.5.0, as designed below.
+- **Associated types with parameters of their own** (generic associated types) and
+  **multi-segment associated paths** (`T::Assoc::f`): `Unsupported` (`Feature`). They need a
+  second level of projection resolution; scheduled with `hm` in v0.5.0, where higher-order
+  types are designed.
+- **Orphan rules**: not this crate's job. They depend on crate (unit-group) boundaries that a
+  single unit does not see; the LexerSketch app, which sees every unit, owns them. Overlap
+  (the part selection's soundness needs) is checked here.
+- **Object safety of `dyn` interfaces** (generic methods, `Self` in argument position): not
+  checked in 0.3; v0.5.0 with the `gradual` boundary work, which also designs vtables.
+- **Host-declared generic functions**: host declarations are monomorphic types; a generic
+  host member is declared per instantiation or on the bare head. A host generic signature
+  API is v0.5.0 (with `hm` schemes, which need the same representation).
+- **Generic records under structural typing** compare nominally (structural comparison is
+  for non-generic named-field records).
+- **Unions containing inference variables** unify member-wise in canonical order; unions in
+  annotations (the common case) are variable-free and compare by id.
+
 ## v0.5.0 - Implementation
-- [ ] Static-inferred (bidirectional, generics, interfaces/traits, monomorphization plan) and HM (let-polymorphism with levels); gradual profile.
-- [ ] Generic items and arguments, traits/interfaces as types, associated types, qualified paths, `impl` on structural types, interface conformance (moved from 0.2.0, above).
+- [ ] HM (let-polymorphism with levels); gradual profile.
+- [ ] Generic associated types, multi-segment associated paths, object safety, host generic signatures (recorded under v0.3.0).
 
 Designs (the profile model already carries every toggle these need):
 
@@ -137,7 +238,8 @@ Operations on `any` are dynamic (`OpClass::Dynamic`, `promote` legal). `let` inf
 `static-explicit`. Soundness claim: a run-time type error can only occur at a recorded
 `FromAny` boundary.
 
-**`static-inferred`** (Kraken, Iron). Bidirectional checking: expected types already flow
+**`static-inferred`** (Kraken, Iron) — *delivered in v0.3.0 as described under v0.3.0
+above; the design note is kept for the record.* Bidirectional checking: expected types already flow
 down (0.2.0's expectation machinery becomes the checking mode); closures take parameter types
 from the expected function type; method calls and generic calls instantiate fresh variables
 from the callee's generics and unify argument types with them. Generics: `Adt(item, args)`
@@ -158,9 +260,9 @@ present, are checked as in `static-explicit`.
 
 ## v0.9.0 - Hardening
 - [ ] Adversarial inference inputs (deep and shared types), fuzzing, scale benchmarks (0.2.0
-  already covers deep and shared types and 1M-node benchmarks for its disciplines; 0.9 repeats
-  the work for the 0.5 disciplines, adds a fuzz target over the HIR binary decoder once
-  hir-lang 0.5 ships it).
+  and 0.3.0 already cover deep and shared types, generics, interface resolution, and 1M-node
+  benchmarks for their disciplines; 0.9 repeats the work for the 0.5 disciplines, adds a fuzz
+  target over the HIR binary decoder once hir-lang 0.5 ships it).
 
 ## v1.0.0 - Stable
 - [ ] Frozen after Mox, Mercury, and a Kraken subset check through it (D18).

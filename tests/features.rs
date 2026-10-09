@@ -8,7 +8,7 @@ use hir_lang::{
     Arm, Effects, Expr, FieldPat, Intrinsic, ItemKind, MemOrder, NodeRef, OpKind, ParamKind, Pat,
     Prim, SliceRest, Ty,
 };
-use typeck_lang::{Coercion, DiagnosticKind, Feature, Profile, RecordTyping, Type, TypeId, check};
+use typeck_lang::{Coercion, DiagnosticKind, Profile, RecordTyping, Type, TypeId, check};
 
 const I64: TypeId = TypeId::prim(Prim::I64);
 const I32: TypeId = TypeId::prim(Prim::I32);
@@ -507,10 +507,16 @@ fn test_generators_yield_their_declared_type() {
     let mut k = Kit::new();
     let i32_ = k.prim(Prim::I32);
     let one = k.int(1);
-    let y = k.expr(Expr::Yield(Some(one)));
+    let y = k.expr(Expr::Yield {
+        key: None,
+        value: Some(one),
+    });
     let s = k.stmt(y);
     let t = k.bool(true);
-    let bad = k.expr(Expr::Yield(Some(t)));
+    let bad = k.expr(Expr::Yield {
+        key: None,
+        value: Some(t),
+    });
     let s2 = k.stmt(bad);
     let body = k.block(&[s, s2], None);
     let gen_fn = k.func_fx("count", &[], Some(i32_), Effects::YIELD, body);
@@ -578,7 +584,7 @@ fn test_atomics_and_named_intrinsics() {
 }
 
 #[test]
-fn test_traits_as_types_are_unsupported() {
+fn test_dyn_bound_that_is_not_an_interface() {
     let mut k = Kit::new();
     let any = k.ty(Ty::Any);
     let bounds = k.b.list(&[hir_lang::Bound::Ty(any)]);
@@ -589,12 +595,7 @@ fn test_traits_as_types_are_unsupported() {
     let (hir, _) = k.finish_items(&[f]);
     let typed = static_check(&hir);
     assert_eq!(typed.diagnostics().len(), 1);
-    assert_eq!(
-        typed.diagnostics()[0].kind,
-        DiagnosticKind::Unsupported {
-            feature: Feature::Traits
-        }
-    );
+    assert_eq!(typed.diagnostics()[0].kind, DiagnosticKind::NotAnInterface);
 }
 
 #[test]

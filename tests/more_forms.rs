@@ -56,7 +56,7 @@ fn test_anonymous_record_literals() {
     .unwrap();
     assert!(structural.is_ok(), "{:?}", structural.diagnostics());
     assert!(
-        matches!(structural.types().get(structural.binder(p).unwrap()), Type::Adt(i) if i == point)
+        matches!(structural.types().get(structural.binder(p).unwrap()), Type::Adt { item: i, .. } if i == point)
     );
 }
 
@@ -112,7 +112,9 @@ fn test_named_variant_literals_through_partial_paths() {
     assert_eq!(messages(&typed, &names), ["T0015 missing field `h`"]);
     assert_eq!(typed.path_def(path), Some(Def::Variant(rect)));
     assert_eq!(typed.expr(one), Some(F64));
-    assert!(matches!(typed.types().get(typed.expr(lit).unwrap()), Type::Adt(i) if i == shape));
+    assert!(
+        matches!(typed.types().get(typed.expr(lit).unwrap()), Type::Adt { item: i, .. } if i == shape)
+    );
 }
 
 #[test]
@@ -387,8 +389,12 @@ fn test_recursive_records_compare_structurally_and_terminate() {
     .unwrap();
     assert!(typed.is_ok(), "{:?}", typed.diagnostics());
     // Each binder keeps its declared nominal type.
-    assert!(matches!(typed.types().get(typed.binder(a).unwrap()), Type::Adt(i) if i == node));
-    assert!(matches!(typed.types().get(typed.binder(b).unwrap()), Type::Adt(i) if i == link));
+    assert!(
+        matches!(typed.types().get(typed.binder(a).unwrap()), Type::Adt { item: i, .. } if i == node)
+    );
+    assert!(
+        matches!(typed.types().get(typed.binder(b).unwrap()), Type::Adt { item: i, .. } if i == link)
+    );
     assert!(!static_check(&hir).is_ok(), "nominal: two types");
 }
 

@@ -5,12 +5,13 @@
 use alloc::vec::Vec;
 
 use hir_lang::{
-    ExprId, FieldId, IdKind, Item, ItemId, ItemKind, NodeRef, PatId, Shape, Symbol, Ty, VariantId,
+    Bound, Control, Event, ExprId, FieldId, GenericArg, IdKind, Item, ItemId, ItemKind, NodeRef,
+    PatId, Shape, Symbol, Ty, TyId, VariantId,
 };
 
 use super::Ctx;
 use crate::{
-    diag::{DiagnosticKind, Feature},
+    diag::DiagnosticKind,
     error::CheckError,
     typed::NONE,
     types::{Field, Tag, TypeId},
@@ -55,12 +56,13 @@ pub(crate) struct Index {
     pub(crate) fields: Vec<(FieldOwner, Symbol, u32, FieldId)>,
     /// Per field: the item that owns it (the sum, for variant fields).
     pub(crate) field_owner: Vec<u32>,
-    /// Per class item: its base classes, a range of `base_pool`.
+    /// Per class item: its base classes, a range of `base_pool` (and of
+    /// `base_type_pool`, their types in the class's placeholders).
     pub(crate) bases: Vec<(u32, u32)>,
     pub(crate) base_pool: Vec<ItemId>,
-    /// Per item: members may be missing from the tables (a mixin use, a
-    /// generic impl the checker cannot index), so a failed lookup is
-    /// silent.
+    pub(crate) base_type_pool: Vec<TypeId>,
+    /// Per item: members may be missing from the tables (a class using a
+    /// mixin, which resolve-lang expands), so a failed lookup is silent.
     pub(crate) incomplete: Vec<bool>,
     /// Per item: its `Self` type, once computed (`NONE`: none or unknown).
     pub(crate) self_ty: Vec<u32>,
@@ -117,22 +119,105 @@ impl Index {
             .get(start as usize..(start as usize).saturating_add(len as usize))
             .unwrap_or(&[])
     }
+
+    /// The base classes' types, in the class's placeholders.
+    pub(crate) fn base_types_of(&self, class: ItemId) -> &[TypeId] {
+        let Some(&(start, len)) = self.bases.get(class.index()) else {
+            return &[];
+        };
+        self.base_type_pool
+            .get(start as usize..(start as usize).saturating_add(len as usize))
+            .unwrap_or(&[])
+    }
 }
 
 impl Ctx<'_> {
     pub(crate) fn build_index(&mut self) -> Result<(), CheckError> {
         self.walk_live()?;
         let items = core::mem::take(&mut self.idx.items);
+        if self.profile.is_static() {
+            for &item in &items {
+                self.collect_impl_tys(item)?;
+            }
+            self.impl_tys.sort_by_key(|&(t, o, _)| (o, t));
+            self.impl_ty_index = self
+                .impl_tys
+                .iter()
+                .enumerate()
+                .map(|(k, &(t, _, _))| (t, u32::try_from(k).unwrap_or(NONE)))
+                .collect();
+            self.impl_ty_index.sort_unstable();
+        }
         for &item in &items {
             self.meter.tick(1)?;
             self.index_item(item)?;
         }
-        self.idx.items = items;
         self.idx.members.sort_by_key(|m| (m.owner, m.name, m.item));
         self.idx.variants.sort_unstable();
         self.idx.fields.sort_unstable();
+        if self.profile.is_static() {
+            // Interfaces first (their member tables answer associated-type
+            // bindings in impl headers), then implementations.
+            for &item in &items {
+                if matches!(self.item_kind(item), ItemKind::Interface(_)) {
+                    self.meter.tick(1)?;
+                    self.index_impls(item)?;
+                }
+            }
+            self.tr
+                .iface_members
+                .sort_unstable_by_key(|&(r, n, i)| (r, n, i));
+            self.finish_trait_index();
+        }
+        self.idx.items = items;
         self.index_bases()?;
+        if self.profile.is_static() {
+            let items = core::mem::take(&mut self.idx.items);
+            for &item in &items {
+                if matches!(self.item_kind(item), ItemKind::Impl(_) | ItemKind::Class(_)) {
+                    self.meter.tick(1)?;
+                    self.index_impls(item)?;
+                }
+            }
+            self.idx.items = items;
+            self.finish_trait_index();
+        }
         self.index_record_shapes()?;
+        if self.profile.is_static() {
+            self.check_coherence()?;
+        }
+        Ok(())
+    }
+
+    /// Records the `impl Trait` type nodes of a function's signature: in a
+    /// parameter type, an anonymous generic parameter; in the result type,
+    /// an opaque type.
+    fn collect_impl_tys(&mut self, item: ItemId) -> Result<(), CheckError> {
+        let ItemKind::Fn(def) = self.item_kind(item) else {
+            return Ok(());
+        };
+        let hir = self.hir;
+        let mut roots: Vec<(TyId, bool)> = hir
+            .list(def.params)
+            .iter()
+            .filter_map(|&p| hir.param(p).ty)
+            .map(|t| (t, false))
+            .collect();
+        if let Some(r) = def.ret {
+            roots.push((r, true));
+        }
+        for (root, rpit) in roots {
+            let mut stack = alloc::vec![root];
+            while let Some(t) = stack.pop() {
+                self.meter.tick(1)?;
+                let node = *hir.ty(t);
+                if let Ty::Impl(_) = node {
+                    self.impl_tys.push((t, item, rpit));
+                    continue;
+                }
+                type_children_all(&node, hir, &mut stack);
+            }
+        }
         Ok(())
     }
 
@@ -147,17 +232,36 @@ impl Ctx<'_> {
         idx.self_ty = alloc::vec![NONE; n_items];
         idx.bases = alloc::vec![(0, 0); n_items];
         idx.field_owner = alloc::vec![NONE; hir.count(IdKind::Field)];
-        // The plain preorder walk is enough: only live nodes and item owners
-        // are needed, and owners come from the member lists below.
+        // One walk: live nodes in preorder, and the size of each item's own
+        // part (nodes not inside a nested item), for the plan.
         let mut steps = 0u64;
-        hir_lang::walk(hir, |node| {
-            steps += 1;
-            match node {
-                NodeRef::Item(i) => idx.items.push(i),
-                NodeRef::Expr(e) => idx.exprs.push(e),
-                NodeRef::Pat(p) => idx.pats.push(p),
+        let sizes = &mut self.item_size;
+        let mut open: Vec<ItemId> = Vec::new();
+        hir.walk_from(NodeRef::Item(hir.root()), |event| {
+            match event {
+                Event::Enter(node) => {
+                    steps += 1;
+                    if let Some(&top) = open.last() {
+                        if let Some(n) = sizes.get_mut(top.index()) {
+                            *n = n.saturating_add(1);
+                        }
+                    }
+                    match node {
+                        NodeRef::Item(i) => {
+                            idx.items.push(i);
+                            open.push(i);
+                        }
+                        NodeRef::Expr(e) => idx.exprs.push(e),
+                        NodeRef::Pat(p) => idx.pats.push(p),
+                        _ => {}
+                    }
+                }
+                Event::Leave(NodeRef::Item(_)) => {
+                    let _ = open.pop();
+                }
                 _ => {}
             }
+            Control::Continue
         });
         // Members see their owner's generic parameters (and `Self`).
         for &i in &idx.items {
@@ -223,7 +327,11 @@ impl Ctx<'_> {
                 for (pos, &f) in self.hir.list(def.fields).iter().enumerate() {
                     self.add_field(FieldOwner::Item(raw), raw, pos, f, Shape::Named);
                 }
-                let owner = self.types.adt(item);
+                let owner = if self.profile.is_static() {
+                    self.adt_identity(item)
+                } else {
+                    self.types.adt(item)
+                };
                 self.set_self(item, owner);
                 for &m in self.hir.list(def.items) {
                     if matches!(self.item_kind(m), ItemKind::MixinUse(_)) {
@@ -235,57 +343,24 @@ impl Ctx<'_> {
                     self.add_member(owner, m, false);
                 }
             }
-            ItemKind::Interface(def) => {
+            ItemKind::Interface(_) => {
                 let owner = self.types.self_of(item);
                 self.set_self(item, owner);
-                for &m in self.hir.list(def.items) {
-                    self.add_member(owner, m, false);
+            }
+            ItemKind::Impl(def) if !self.profile.is_static() => {
+                // Nothing is lowered under `Dynamic`; impls on a named
+                // declaration are indexed for path tails. (Static profiles
+                // index every impl in the trait index.)
+                if let Some(head) = self.ty_head_item(def.self_ty) {
+                    let owner = self.types.adt(head);
+                    self.set_self(item, owner);
+                    let via_interface = def.interface.is_some();
+                    for &m in self.hir.list(def.items) {
+                        self.add_member(owner, m, via_interface);
+                    }
                 }
             }
-            ItemKind::Impl(def) => self.index_impl(item, def)?,
             _ => {}
-        }
-        Ok(())
-    }
-
-    fn index_impl(&mut self, item: ItemId, def: hir_lang::ImplDef) -> Result<(), CheckError> {
-        if self.idx.is_generic(item) {
-            // A generic impl's self type mentions its parameters; until
-            // generics land (0.5) its members are not indexed, and lookups
-            // on the type it extends stay silent.
-            if let Some(head) = self.ty_head_item(def.self_ty) {
-                self.mark_incomplete(head);
-            }
-            return Ok(());
-        }
-        let owner = if self.profile.is_static() {
-            let t = self.lower_ty(def.self_ty, None, true)?;
-            self.resolve(t)
-        } else {
-            // Nothing is lowered under `Dynamic`; only impls on a named
-            // declaration are indexed (for path tails).
-            match self.ty_head_item(def.self_ty) {
-                Some(head) => self.types.adt(head),
-                None => return Ok(()),
-            }
-        };
-        self.set_self(item, owner);
-        match self.types.node(owner).tag {
-            Tag::Adt | Tag::Prim | Tag::Extern | Tag::Foreign => {}
-            Tag::Error => return Ok(()),
-            _ => {
-                self.report(
-                    NodeRef::Ty(def.self_ty),
-                    DiagnosticKind::Unsupported {
-                        feature: Feature::StructuralImpls,
-                    },
-                );
-                return Ok(());
-            }
-        }
-        let via_interface = def.interface.is_some();
-        for &m in self.hir.list(def.items) {
-            self.add_member(owner, m, via_interface);
         }
         Ok(())
     }
@@ -356,7 +431,10 @@ impl Ctx<'_> {
             for &b in self.hir.list(def.bases) {
                 self.meter.tick(1)?;
                 let t = if self.profile.is_static() {
-                    self.lower_ty(b, None, true)?
+                    let saved = self.lower_ctx.replace(item);
+                    let t = self.lower_ty(b, None, true);
+                    self.lower_ctx = saved;
+                    t?
                 } else {
                     self.ty_head_item(b)
                         .map_or(TypeId::ERROR, |i| self.types.adt(i))
@@ -370,6 +448,7 @@ impl Ctx<'_> {
                 match base {
                     Some(base) => {
                         self.idx.base_pool.push(base);
+                        self.idx.base_type_pool.push(t);
                         len += 1;
                     }
                     None if n.tag == Tag::Error => {}
@@ -441,7 +520,7 @@ impl Ctx<'_> {
             let ItemKind::Record(def) = self.item_kind(item) else {
                 continue;
             };
-            if def.shape != Shape::Named || def.is_union || self.idx.is_generic(item) {
+            if def.shape != Shape::Named || def.is_union || self.is_generic_item(item) {
                 continue;
             }
             let mut fields = Vec::new();
@@ -487,4 +566,56 @@ fn is_member_owner(item: &Item) -> bool {
         item.kind,
         ItemKind::Impl(_) | ItemKind::Class(_) | ItemKind::Interface(_)
     )
+}
+
+/// The type children of a type node, including the types inside a path's
+/// generic arguments and a bound list's interface paths.
+pub(crate) fn type_children_all(node: &Ty, hir: &hir_lang::Hir, out: &mut Vec<TyId>) {
+    let path_args = |p: hir_lang::PathId, out: &mut Vec<TyId>| {
+        let path = hir.path(p);
+        if let Some(q) = path.qself {
+            out.push(q.ty);
+        }
+        for seg in hir.list(path.segments) {
+            for a in hir.list(seg.args) {
+                match *a {
+                    GenericArg::Ty(t) | GenericArg::Binding { ty: t, .. } => out.push(t),
+                    GenericArg::Constraint { bounds, .. } => {
+                        out.extend(hir.list(bounds).iter().filter_map(|b| match *b {
+                            Bound::Ty(t) => Some(t),
+                            Bound::Region(_) => None,
+                        }));
+                    }
+                    _ => {}
+                }
+            }
+        }
+    };
+    match *node {
+        Ty::Tuple(list) | Ty::Union(list) | Ty::Intersection(list) => {
+            out.extend_from_slice(hir.list(list));
+        }
+        Ty::Array { elem, .. } => out.push(elem),
+        Ty::Slice(t) | Ty::Ref { inner: t, .. } | Ty::Ptr { inner: t, .. } | Ty::Nullable(t) => {
+            out.push(t);
+        }
+        Ty::Fn {
+            params,
+            ret,
+            throws,
+            ..
+        } => {
+            out.extend_from_slice(hir.list(params));
+            out.push(ret);
+            out.extend(throws);
+        }
+        Ty::Path(p) => path_args(p, out),
+        Ty::Object(bounds) | Ty::Impl(bounds) => {
+            out.extend(hir.list(bounds).iter().filter_map(|b| match *b {
+                Bound::Ty(t) => Some(t),
+                Bound::Region(_) => None,
+            }));
+        }
+        _ => {}
+    }
 }

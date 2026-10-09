@@ -84,8 +84,8 @@ impl Ctx<'_> {
             }
         }
         if self.profile.subtyping {
-            if let (Type::Adt(a), Type::Adt(b)) = (self.types.get(f), self.types.get(x)) {
-                if self.is_subclass(a, b)? {
+            if let (Type::Adt { .. }, Type::Adt { .. }) = (self.types.get(f), self.types.get(x)) {
+                if self.upcast(f, x)? {
                     return Ok(Fit::Converted(Coercion::Subclass));
                 }
                 if self.profile.records == RecordTyping::Structural && self.record_width(f, x)? {
@@ -94,6 +94,10 @@ impl Ctx<'_> {
             } else if self.profile.records == RecordTyping::Structural && self.record_width(f, x)? {
                 return Ok(Fit::Converted(Coercion::RecordWidth));
             }
+        }
+        // Unions, intersections, and interface types.
+        if let Some(fit) = self.coerce_compound(f, x)? {
+            return Ok(fit);
         }
         // Views borrow the store; copy out the ids before unifying.
         enum Shape {
@@ -132,10 +136,148 @@ impl Ctx<'_> {
                 if fm && self.unify(fi, xi)? {
                     return Ok(Fit::Converted(Coercion::Reborrow));
                 }
+                // `&T` as `&dyn Iface` (and `&A & B` as `&A`).
+                if matches!(self.tag(xi_r), Tag::Dyn | Tag::Union | Tag::Inter)
+                    || self.tag(fi_r) == Tag::Inter
+                {
+                    if let Some(Fit::Converted(c)) = self.coerce_compound(fi_r, xi_r)? {
+                        return Ok(Fit::Converted(c));
+                    }
+                }
             }
             _ => {}
         }
         Ok(Fit::No)
+    }
+
+    /// Coercions into and out of unions, intersections, and `dyn` types.
+    /// `None`: none applies.
+    fn coerce_compound(&mut self, f: TypeId, x: TypeId) -> Result<Option<Fit>, CheckError> {
+        let (ft, xt) = (self.tag(f), self.tag(x));
+        // A value into a union containing (a supertype of) its type; a
+        // union into a union containing all its members.
+        if xt == Tag::Union {
+            let members = self.types.kids(x).to_vec();
+            let found: Vec<TypeId> = if ft == Tag::Union {
+                self.types.kids(f).to_vec()
+            } else {
+                alloc::vec![f]
+            };
+            let snap = self.infer.snapshot();
+            let mut all = true;
+            for &v in &found {
+                let mut ok = members.contains(&v);
+                for &m in &members {
+                    if ok {
+                        break;
+                    }
+                    ok = self.coerce_with(v, m, true)? != Fit::No;
+                }
+                if !ok {
+                    all = false;
+                    break;
+                }
+            }
+            if all {
+                self.infer.commit();
+                return Ok(Some(Fit::Converted(Coercion::ToUnion)));
+            }
+            self.infer.rollback(snap);
+            return Ok(None);
+        }
+        // Into an intersection: into every member.
+        if xt == Tag::Inter {
+            let members = self.types.kids(x).to_vec();
+            let snap = self.infer.snapshot();
+            let mut same = true;
+            for m in members {
+                match self.coerce_with(f, m, true)? {
+                    Fit::Same => {}
+                    Fit::Converted(_) => same = false,
+                    Fit::No => {
+                        self.infer.rollback(snap);
+                        return Ok(None);
+                    }
+                }
+            }
+            self.infer.commit();
+            return Ok(Some(if same {
+                Fit::Same
+            } else {
+                Fit::Converted(Coercion::Subclass)
+            }));
+        }
+        // Out of an intersection: as any member.
+        if ft == Tag::Inter {
+            let members = self.types.kids(f).to_vec();
+            for m in members {
+                let snap = self.infer.snapshot();
+                if self.coerce_with(m, x, true)? != Fit::No {
+                    self.infer.commit();
+                    return Ok(Some(Fit::Converted(Coercion::FromIntersection)));
+                }
+                self.infer.rollback(snap);
+            }
+            return Ok(None);
+        }
+        // Into a `dyn` type: the value's type must implement each
+        // interface (checked as goals), with the bound associated types.
+        if xt == Tag::Dyn && !matches!(ft, Tag::Var | Tag::Error) {
+            let want = self.types.kids(x).to_vec();
+            if ft == Tag::Dyn {
+                // Upcasting a trait object: every wanted interface is one of
+                // the value's.
+                let have = self.types.kids(f).to_vec();
+                let ok = want.iter().all(|w| {
+                    let wi = self.trait_item(*w);
+                    have.iter().any(|h| self.trait_item(*h) == wi)
+                });
+                return Ok(ok.then_some(Fit::Converted(Coercion::ToDyn)));
+            }
+            let at = self.coerce_site;
+            for tr in want {
+                let Some(iface) = self.trait_item(tr) else {
+                    continue;
+                };
+                let args = self.trait_args(tr);
+                let slots: Vec<TypeId> = self
+                    .types
+                    .kids(tr)
+                    .get(args.len()..)
+                    .unwrap_or(&[])
+                    .to_vec();
+                let bare = self.types.trait_ref(iface, &args);
+                self.oblige_impl(f, bare, at);
+                for (assoc, v) in self.assoc_types(iface).into_iter().zip(slots) {
+                    self.oblige_projection(f, bare, assoc, v, at);
+                }
+                self.dyn_uses.push((self.cur_item, f, bare));
+            }
+            return Ok(Some(Fit::Converted(Coercion::ToDyn)));
+        }
+        Ok(None)
+    }
+
+    /// Whether `sub` is (an instance of) a subclass of `sup`'s class, with
+    /// arguments that agree: unifies them when it is.
+    pub(crate) fn upcast(&mut self, sub: TypeId, sup: TypeId) -> Result<bool, CheckError> {
+        let sup = self.resolve(sup);
+        let Type::Adt { item: want, .. } = self.types.get(sup) else {
+            return Ok(false);
+        };
+        for base in self.base_types(sub)? {
+            if let Type::Adt { item, .. } = self.types.get(self.resolve(base)) {
+                if item == want {
+                    let snap = self.infer.snapshot();
+                    if self.unify(base, sup)? {
+                        self.infer.commit();
+                        return Ok(true);
+                    }
+                    self.infer.rollback(snap);
+                }
+            }
+        }
+        Ok(false)
     }
 
     /// Types that `null` may stand for when the profile has no null safety.
@@ -143,15 +285,20 @@ impl Ctx<'_> {
         match self.types.get(t) {
             Type::Ref { .. }
             | Type::Ptr { .. }
-            | Type::Adt(_)
-            | Type::Foreign(_)
-            | Type::Extern(_)
+            | Type::Adt { .. }
+            | Type::Foreign { .. }
+            | Type::Extern { .. }
             | Type::Fn { .. }
             | Type::Slice(_)
             | Type::Map { .. }
             | Type::Nullable(_)
             | Type::Record(_)
             | Type::Param(_)
+            | Type::ImplParam(_)
+            | Type::Dyn(_)
+            | Type::Opaque { .. }
+            | Type::Union(_)
+            | Type::Intersection(_)
             | Type::Async(_)
             | Type::Task(_)
             | Type::Generator { .. } => true,
@@ -213,7 +360,7 @@ impl Ctx<'_> {
         let n = self.types.node(t);
         match n.tag {
             Tag::Record => Some(self.types.fields_of(&n).to_vec()),
-            Tag::Adt => {
+            Tag::Adt if n.len == 0 => {
                 let (start, len) = (*self.record_fields.get(n.x as usize)?)?;
                 self.field_pool
                     .get(start as usize..(start as usize).saturating_add(len as usize))
@@ -231,6 +378,7 @@ impl Ctx<'_> {
         found: TypeId,
         expected: TypeId,
     ) -> Result<bool, CheckError> {
+        self.coerce_site = NodeRef::Expr(e);
         match self.coerce(found, expected)? {
             Fit::Same => Ok(true),
             Fit::Converted(c) => {

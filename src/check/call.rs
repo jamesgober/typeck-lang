@@ -8,15 +8,20 @@
 //! after, it reports arity and naming problems and coerces what could not
 //! be expected in advance (arguments after a spread).
 
-use hir_lang::{
-    Arg, ArgKind, Effects, Expr, ExprId, ItemId, ItemKind, Member, NodeRef, ParamKind, Symbol,
-};
+use alloc::vec::Vec;
 
-use super::{Ctx, lower::ParamInfo, paths::MemberRef};
+use hir_lang::{Arg, ArgKind, Effects, Expr, ExprId, ItemId, ItemKind, Member, NodeRef, ParamKind};
+
+use super::{
+    Ctx,
+    lower::ParamInfo,
+    traits::{MemberLookup, Pick},
+};
 use crate::{
     diag::DiagnosticKind,
     error::CheckError,
     infer::GENERAL,
+    mono::Dispatch,
     typed::Coercion,
     types::{Tag, Type, TypeId},
 };
@@ -50,17 +55,15 @@ impl Ctx<'_> {
         call: ExprId,
         callee: ExprId,
     ) -> Result<CallTarget, CheckError> {
-        if let Some(item) = self.callee_fn(callee) {
-            if let Some(sig) = self.sig(item)? {
-                return Ok(CallTarget::Sig {
-                    sig: u32::try_from(sig).unwrap_or(u32::MAX),
-                    skip: 0,
-                    method: None,
-                    deref: 0,
-                });
-            }
+        if let Some(sig) = self.callee_sig(callee) {
+            return Ok(CallTarget::Sig {
+                sig,
+                skip: 0,
+                method: None,
+                deref: 0,
+            });
         }
-        let t = self.resolve(self.child(callee));
+        let t = self.known(self.child(callee))?;
         Ok(match self.tag(t) {
             Tag::Fn => CallTarget::FnTy { ty: t, skip: 0 },
             Tag::Error | Tag::Never => CallTarget::Silent,
@@ -89,18 +92,18 @@ impl Ctx<'_> {
         })
     }
 
-    /// The function item a callee path names, recorded when the path was
-    /// checked.
-    fn callee_fn(&self, callee: ExprId) -> Option<ItemId> {
-        self.callee_fns
+    /// The (instantiated) signature a callee path names, recorded when the
+    /// path was checked.
+    fn callee_sig(&self, callee: ExprId) -> Option<u32> {
+        self.callee_sigs
             .get(callee.index())
             .copied()
             .filter(|&v| v != crate::typed::NONE)
-            .and_then(|v| ItemId::from_index(v as usize))
     }
 
-    /// Looks up the method of a method call on the receiver's type, through
-    /// references, then a function-typed field of the same name.
+    /// Looks up the method of a method call on the receiver's type (through
+    /// references, when the profile borrows receivers implicitly), then a
+    /// function-typed field of the same name.
     pub(crate) fn method_target(&mut self, call: ExprId) -> Result<CallTarget, CheckError> {
         let Expr::MethodCall {
             receiver,
@@ -112,16 +115,9 @@ impl Ctx<'_> {
             return Ok(CallTarget::Silent);
         };
         let at = NodeRef::Expr(call);
-        if !generic_args.is_empty() {
-            self.report(
-                at,
-                DiagnosticKind::Unsupported {
-                    feature: crate::diag::Feature::Generics,
-                },
-            );
-            return Ok(CallTarget::Silent);
-        }
-        let recv = self.settle_literal(self.child(receiver))?;
+        let own = self.written_args(generic_args);
+        let recv = self.known(self.child(receiver))?;
+        let recv = self.settle_literal(recv)?;
         match self.tag(recv) {
             // An unknown receiver: `CannotInfer` reports the cause.
             Tag::Error | Tag::Never | Tag::Var => return Ok(CallTarget::Silent),
@@ -144,20 +140,22 @@ impl Ctx<'_> {
         let mut incomplete = false;
         loop {
             self.meter.tick(1)?;
-            match self.member_lookup(t, method.sym)? {
-                Lookup::Found(MemberRef::Item(m)) => {
-                    self.methods.push((call, m));
-                    return self.method_item_target(m, deref, at, t, method.sym);
-                }
-                Lookup::Found(MemberRef::Host(ty)) => {
+            match self.lookup_member(t, method.sym, at)? {
+                MemberLookup::Found(Pick::Host(ty)) => {
                     return Ok(if self.tag(ty) == Tag::Fn {
-                        CallTarget::FnTy { ty, skip: 1 }
+                        CallTarget::FnTy {
+                            ty: self.resolve(ty),
+                            skip: 1,
+                        }
                     } else {
                         self.report(at, DiagnosticKind::NotCallable { ty });
                         CallTarget::Silent
                     });
                 }
-                Lookup::Ambiguous => {
+                MemberLookup::Found(pick) => {
+                    return self.method_pick_target(call, &pick, &own, deref, t, method.sym);
+                }
+                MemberLookup::Ambiguous => {
                     self.report(
                         at,
                         DiagnosticKind::AmbiguousMethod {
@@ -167,7 +165,10 @@ impl Ctx<'_> {
                     );
                     return Ok(CallTarget::Silent);
                 }
-                Lookup::NotFound { incomplete: inc } => incomplete |= inc,
+                MemberLookup::NotFound { incomplete: inc } => incomplete |= inc,
+            }
+            if !self.profile.method_autoref {
+                break;
             }
             match self.types.get(self.resolve(t)) {
                 Type::Ref { inner, .. } => {
@@ -196,33 +197,55 @@ impl Ctx<'_> {
         Ok(CallTarget::Silent)
     }
 
-    fn method_item_target(
+    /// The call target of a picked method: instantiated, its bounds
+    /// queued, the use recorded.
+    fn method_pick_target(
         &mut self,
-        m: ItemId,
+        call: ExprId,
+        pick: &Pick,
+        own: &[hir_lang::GenericArg],
         deref: u32,
-        at: NodeRef,
         owner: TypeId,
-        name: Symbol,
+        name: hir_lang::Symbol,
     ) -> Result<CallTarget, CheckError> {
-        if self.idx.is_generic(m) {
+        let at = NodeRef::Expr(call);
+        let member = match pick {
+            Pick::Rec { member, .. } | Pick::Iface { member, .. } => *member,
+            Pick::Host(_) => return Ok(CallTarget::Silent),
+        };
+        let own_args = if own.is_empty() {
+            None
+        } else {
+            Some(self.fill_args(member, own, at, false, None)?)
+        };
+        let Some((member, args)) = self.pick_args(pick, own_args.as_deref()) else {
             return Ok(CallTarget::Silent);
-        }
-        let Some(sig) = self.sig(m)? else {
+        };
+        self.methods.push((call, member));
+        let dispatch = match pick {
+            Pick::Iface { dynamic: true, .. } => Dispatch::Dynamic,
+            Pick::Iface { .. } => Dispatch::Bound,
+            _ => Dispatch::Static,
+        };
+        if !matches!(self.item_kind(member), ItemKind::Fn(_)) {
             // A constant or global member called as a method.
-            let t = self.decl_type(m)?;
+            let t = self.decl_type(member)?;
+            let params = self.placeholders(member);
+            let t = self.subst(t, &params, &args)?;
+            let t = self.resolve(t);
             return Ok(if self.tag(t) == Tag::Fn {
-                CallTarget::FnTy {
-                    ty: self.resolve(t),
-                    skip: 0,
-                }
+                CallTarget::FnTy { ty: t, skip: 0 }
             } else {
                 self.report(at, DiagnosticKind::NotCallable { ty: t });
                 CallTarget::Silent
             });
+        }
+        let Some(sig) = self.inst_sig(member, &args, at)? else {
+            return Ok(CallTarget::Silent);
         };
         let has_receiver = self
             .sig_arena
-            .get(sig)
+            .get(sig as usize)
             .and_then(|s| s.params.first())
             .is_some_and(|p| p.kind == ParamKind::Receiver);
         if !has_receiver {
@@ -231,10 +254,12 @@ impl Ctx<'_> {
             self.report(at, DiagnosticKind::NoMethod { ty: owner, name });
             return Ok(CallTarget::Silent);
         }
+        self.push_bounds(member, &args, at)?;
+        self.record_use(call, member, &args, dispatch);
         Ok(CallTarget::Sig {
-            sig: u32::try_from(sig).unwrap_or(u32::MAX),
+            sig,
             skip: 1,
-            method: Some(m),
+            method: Some(member),
             deref,
         })
     }
@@ -255,6 +280,7 @@ impl Ctx<'_> {
         let _ = sig;
         let found = self.child(receiver);
         let want = self.resolve(param.ty);
+        self.coerce_site = NodeRef::Expr(receiver);
         match self.coerce(found, want)? {
             super::coerce::Fit::Same => return Ok(()),
             super::coerce::Fit::Converted(c) => {
@@ -262,6 +288,17 @@ impl Ctx<'_> {
                 return Ok(());
             }
             super::coerce::Fit::No => {}
+        }
+        if !self.profile.method_autoref {
+            self.report(
+                NodeRef::Expr(receiver),
+                DiagnosticKind::Mismatch {
+                    expected: want,
+                    found,
+                },
+            );
+            self.poison(receiver);
+            return Ok(());
         }
         // Peel the references the lookup looked through.
         let mut base = self.resolve(found);
@@ -281,11 +318,13 @@ impl Ctx<'_> {
             return Ok(());
         }
         // Methods found on a base class take the subclass receiver.
-        if let (Type::Adt(sub), Type::Adt(sup)) = (self.types.get(base), self.types.get(want)) {
-            if self.is_subclass(sub, sup)? {
-                self.coercions.push((receiver, Coercion::Subclass, want));
-                return Ok(());
-            }
+        let target = match self.types.get(want) {
+            Type::Ref { inner, .. } => self.resolve(inner),
+            _ => want,
+        };
+        if self.upcast(base, target)? {
+            self.coercions.push((receiver, Coercion::Subclass, want));
+            return Ok(());
         }
         self.report(
             NodeRef::Expr(receiver),
@@ -332,7 +371,7 @@ impl Ctx<'_> {
         }
     }
 
-    fn param_named(&self, target: CallTarget, name: Symbol) -> Option<usize> {
+    fn param_named(&self, target: CallTarget, name: hir_lang::Symbol) -> Option<usize> {
         match target {
             CallTarget::Sig { sig, .. } => self.sig_arena.get(sig as usize)?.param_named(name),
             _ => None,
@@ -381,6 +420,12 @@ impl Ctx<'_> {
             return Ok(());
         }
         let n = self.param_count(target);
+        if !finish {
+            if let Some(x) = self.peek_expect(call) {
+                self.probe_expectations(call, target, n, x)?;
+            }
+        }
+        let probed = matches!(self.probes.last(), Some((c, _)) if *c == call);
         let skip = Self::skip_of(target);
         let mut filled = core::mem::take(&mut self.filled);
         filled.clear();
@@ -427,10 +472,10 @@ impl Ctx<'_> {
                             if let Some(f) = filled.get_mut(i) {
                                 *f = true;
                             }
-                            self.arg_to(arg, target, i, after_spread, finish)?;
+                            self.arg_to(arg, target, i, after_spread, finish, probed)?;
                         }
                         None => match rest {
-                            Some(r) => self.arg_to(arg, target, r, after_spread, finish)?,
+                            Some(r) => self.arg_to(arg, target, r, after_spread, finish, probed)?,
                             None => too_many = true,
                         },
                     }
@@ -448,10 +493,10 @@ impl Ctx<'_> {
                         if let Some(f) = filled.get_mut(i) {
                             *f = true;
                         }
-                        self.arg_to(arg, target, i, after_spread, finish)?;
+                        self.arg_to(arg, target, i, after_spread, finish, probed)?;
                     }
                     None => match rest_named {
-                        Some(r) => self.arg_to(arg, target, r, after_spread, finish)?,
+                        Some(r) => self.arg_to(arg, target, r, after_spread, finish, probed)?,
                         None => {
                             if finish {
                                 self.report(
@@ -482,6 +527,9 @@ impl Ctx<'_> {
                     }
                 }
             }
+        }
+        if finish && probed {
+            let _ = self.probes.pop();
         }
         if finish {
             if too_many {
@@ -546,6 +594,7 @@ impl Ctx<'_> {
     }
 
     /// One argument meets parameter `i`.
+    #[allow(clippy::too_many_arguments)]
     fn arg_to(
         &mut self,
         arg: &Arg,
@@ -553,15 +602,24 @@ impl Ctx<'_> {
         i: usize,
         after_spread: bool,
         finish: bool,
+        probed: bool,
     ) -> Result<(), CheckError> {
         let Some(p) = self.param_at(target, i) else {
             return Ok(());
         };
+        // Only this call's probe (a nested call without one must not read
+        // its enclosing call's).
+        let probe = match self.probes.last() {
+            Some((_, tys)) if probed => tys.get(i).copied().flatten(),
+            _ => None,
+        };
         if !finish {
-            self.set_expect(arg.value, p.ty);
+            self.set_expect(arg.value, probe.unwrap_or(p.ty));
             return Ok(());
         }
-        if after_spread {
+        if after_spread || probe.is_some() {
+            // An argument that met the expectation derived from the call's
+            // expected result still binds the parameter's variables.
             let found = self.child(arg.value);
             let _ = self.coerce_expr(arg.value, found, p.ty)?;
         }
@@ -569,6 +627,92 @@ impl Ctx<'_> {
             self.report(NodeRef::Expr(arg.value), DiagnosticKind::ByRefNeedsPlace);
         }
         Ok(())
+    }
+
+    /// Checking mode for generic calls: when the call has an expected type,
+    /// a probe unifies the callee's result with it (then rolls back) and
+    /// reads what that says about each parameter, so the arguments are
+    /// checked against it and a wrong argument is reported at itself.
+    fn probe_expectations(
+        &mut self,
+        call: ExprId,
+        target: CallTarget,
+        n: usize,
+        expected: TypeId,
+    ) -> Result<(), CheckError> {
+        let ret = self.call_result_of(target);
+        if self.is_err(expected) || !self.has_unbound(ret)? {
+            return Ok(());
+        }
+        // The parameters whose types the probe may teach something.
+        let mut open: Vec<(usize, TypeId)> = Vec::new();
+        for i in 0..n {
+            if let Some(p) = self.param_at(target, i) {
+                if self.has_unbound(p.ty)? {
+                    open.push((i, p.ty));
+                }
+            }
+        }
+        if open.is_empty() {
+            return Ok(());
+        }
+        let snap = self.infer.snapshot();
+        let mut tys: Vec<Option<TypeId>> = alloc::vec![None; n];
+        if self.unify(ret, expected)? {
+            for (i, ty) in open {
+                let deep = self.resolve_deep(ty)?;
+                if deep != ty {
+                    if let Some(slot) = tys.get_mut(i) {
+                        *slot = Some(deep);
+                    }
+                }
+            }
+        }
+        self.infer.rollback(snap);
+        if tys.iter().any(Option::is_some) {
+            self.probes.push((call, tys));
+        }
+        Ok(())
+    }
+
+    /// `t` with every bound variable replaced by its binding (unbound ones
+    /// kept): a type that stays meaningful after a rollback.
+    pub(crate) fn resolve_deep(&mut self, t: TypeId) -> Result<TypeId, CheckError> {
+        let mut memo: alloc::collections::BTreeMap<TypeId, TypeId> =
+            alloc::collections::BTreeMap::new();
+        let mut stack: Vec<(TypeId, bool)> = alloc::vec![(t, false)];
+        let mut kids: Vec<TypeId> = Vec::new();
+        while let Some((x, expanded)) = stack.pop() {
+            self.meter.tick(1)?;
+            if !expanded && memo.contains_key(&x) {
+                continue;
+            }
+            let rep = self.resolve(x);
+            let node = self.types.node(rep);
+            if !node.has_var || node.tag == Tag::Var {
+                let _ = memo.insert(x, rep);
+                continue;
+            }
+            if !expanded {
+                stack.push((x, true));
+                let m = &memo;
+                self.types.for_each_child(rep, |k| {
+                    if !m.contains_key(&k) {
+                        stack.push((k, false));
+                    }
+                });
+                continue;
+            }
+            kids.clear();
+            let m = &memo;
+            let infer = &self.infer;
+            self.types.for_each_child(rep, |k| {
+                kids.push(m.get(&k).copied().unwrap_or_else(|| infer.resolve(k)))
+            });
+            let rebuilt = self.types.rebuild(rep, &kids);
+            let _ = memo.insert(x, rebuilt);
+        }
+        Ok(memo.get(&t).copied().unwrap_or(t))
     }
 
     /// A positional spread (`f(...xs)`). Returns how many positional values
@@ -757,6 +901,17 @@ impl Ctx<'_> {
         Ok(())
     }
 
+    /// `t` resolved; when it is still a variable, pending interface goals
+    /// are solved first (an associated type's value may decide it): for
+    /// the places that need a type's structure now (a field, a method, an
+    /// index, a callee).
+    pub(crate) fn known(&mut self, t: TypeId) -> Result<TypeId, CheckError> {
+        if self.tag(t) == Tag::Var && !self.pending.is_empty() {
+            self.solve()?;
+        }
+        Ok(self.resolve(t))
+    }
+
     /// Resolves `t`; an unresolved literal variable takes its default type
     /// now (members are looked up on the default, as `5.abs()` on `i64`).
     pub(crate) fn settle_literal(&mut self, t: TypeId) -> Result<TypeId, CheckError> {
@@ -775,7 +930,9 @@ impl Ctx<'_> {
     // -------------------------------------------------------------- fields
 
     /// The type of member `m` of a value of type `base`, looking through
-    /// references and base classes. `None` if there is no such field.
+    /// references, base classes, and the members of an intersection; a
+    /// union's members must all have the field, with one type. `None` if
+    /// there is no such field.
     pub(crate) fn field_of(
         &mut self,
         base: TypeId,
@@ -798,22 +955,61 @@ impl Ctx<'_> {
                         Member::Index(_) => None,
                     });
                 }
-                Type::Adt(item) => return self.adt_field(item, m),
+                Type::Adt { .. } => return self.adt_field(t, m),
+                Type::Intersection(ms) => {
+                    let ms = ms.to_vec();
+                    for x in ms {
+                        if let Some(f) = self.adt_field_or_record(x, m)? {
+                            return Ok(Some(f));
+                        }
+                    }
+                    return Ok(None);
+                }
+                Type::Union(ms) => {
+                    let ms = ms.to_vec();
+                    let mut common: Option<TypeId> = None;
+                    for x in ms {
+                        let Some(f) = self.adt_field_or_record(x, m)? else {
+                            return Ok(None);
+                        };
+                        match common {
+                            None => common = Some(f),
+                            Some(c) => {
+                                if !self.unify(c, f)? {
+                                    return Ok(None);
+                                }
+                            }
+                        }
+                    }
+                    return Ok(common);
+                }
                 _ => return Ok(None),
             }
         }
     }
 
-    fn adt_field(&mut self, item: ItemId, m: Member) -> Result<Option<TypeId>, CheckError> {
-        self.new_visit();
-        let mut queue = alloc::vec![item];
-        let mut qi = 0;
-        while let Some(&c) = queue.get(qi) {
-            qi += 1;
+    fn adt_field_or_record(&mut self, t: TypeId, m: Member) -> Result<Option<TypeId>, CheckError> {
+        let t = self.resolve(t);
+        match self.types.get(t) {
+            Type::Adt { .. } => self.adt_field(t, m),
+            Type::Record(fields) => Ok(match m {
+                Member::Named(s) => fields.iter().find(|f| f.name == s).map(|f| f.ty),
+                Member::Index(_) => None,
+            }),
+            _ => Ok(None),
+        }
+    }
+
+    /// A field of a nominal instance or of one of its base classes, with
+    /// the instance's arguments substituted.
+    fn adt_field(&mut self, t: TypeId, m: Member) -> Result<Option<TypeId>, CheckError> {
+        let mut levels = alloc::vec![self.resolve(t)];
+        levels.extend(self.base_types(t)?);
+        for lt in levels {
             self.meter.tick(1)?;
-            if !self.visit(c) {
+            let Some((c, params, args)) = self.adt_subst(lt) else {
                 continue;
-            }
+            };
             let raw = u32::try_from(c.index()).unwrap_or(u32::MAX);
             let field = match (self.item_kind(c), m) {
                 (ItemKind::Record(_) | ItemKind::Class(_), Member::Named(s)) => self
@@ -828,17 +1024,17 @@ impl Ctx<'_> {
                 _ => None,
             };
             if let Some(f) = field {
-                return Ok(Some(self.field_type(f)?));
+                let ft = self.field_type(f)?;
+                return Ok(Some(self.subst(ft, &params, &args)?));
             }
-            queue.extend(self.idx.bases_of(c).iter().copied());
         }
         Ok(None)
     }
 
-    /// Whether member lookups on `t` may be missing members (a class with
-    /// mixins, a type extended by generic impls).
+    /// Whether member lookups on `t` may be missing members (a class using
+    /// a mixin, which resolve-lang expands).
     pub(crate) fn members_incomplete(&mut self, t: TypeId) -> bool {
-        let Type::Adt(item) = self.types.get(self.resolve(t)) else {
+        let Type::Adt { item, .. } = self.types.get(self.resolve(t)) else {
             return false;
         };
         self.new_visit();
@@ -854,12 +1050,4 @@ impl Ctx<'_> {
         }
         false
     }
-}
-
-/// The outcome of a member lookup.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Lookup {
-    Found(MemberRef),
-    Ambiguous,
-    NotFound { incomplete: bool },
 }

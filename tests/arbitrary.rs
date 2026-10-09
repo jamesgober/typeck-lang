@@ -13,7 +13,14 @@ use hir_lang::{
     SumDef, Symbol, Ty, TyId, Variant,
 };
 use proptest::prelude::*;
-use typeck_lang::{Budget, CheckError, Checker, Profile, RecordTyping, check};
+use typeck_lang::{Budget, CheckError, Checker, Limit, Profile, RecordTyping, TryHook, check};
+
+/// The kinds of a random generic-argument list.
+fn alloc_args(s: &RawStep) -> Vec<u8> {
+    (0..1 + s.b % 3)
+        .map(|i| (s.a.wrapping_add(i)) % 3)
+        .collect()
+}
 
 /// One random construction step: a form and three operands.
 #[derive(Clone, Debug)]
@@ -160,12 +167,372 @@ impl Random {
     }
 
     fn step(&mut self, s: &RawStep) {
-        let kind = s.kind % 48;
+        let kind = s.kind % 62;
         if kind < 29 {
             let e = self.expr_step(kind, s);
             self.exprs.push(e);
-        } else {
+        } else if kind < 48 {
             self.other_step(kind, s);
+        } else {
+            self.v3_step(kind, s);
+        }
+    }
+
+    /// A bound list of up to two interface-ish paths.
+    fn bounds(&mut self, n: u8, x: u8) -> hir_lang::List<hir_lang::Bound> {
+        let bs: Vec<hir_lang::Bound> = (0..n % 3)
+            .map(|i| {
+                let p = self.path(Ns::Type, x.wrapping_add(i));
+                hir_lang::Bound::Ty(self.b.ty(Ty::Path(p)))
+            })
+            .collect();
+        self.b.list(&bs)
+    }
+
+    /// Generic parameters with random bounds; the parameters' types are
+    /// pushed to the type pool (they may end up out of scope, which lenient
+    /// validation repairs).
+    fn generics(&mut self, s: &RawStep) -> hir_lang::Generics {
+        let n = s.b % 3;
+        let mut params = Vec::new();
+        for i in 0..n {
+            let kind = if s.c % 5 == 0 {
+                BinderKind::ConstParam
+            } else {
+                BinderKind::TypeParam
+            };
+            let binder = self.binder(kind);
+            let bounds = self.bounds(s.a.wrapping_add(i), s.c);
+            let ty = (kind == BinderKind::ConstParam).then(|| self.b.ty(Ty::Prim(Prim::Usize)));
+            params.push(hir_lang::GenericParam {
+                binder,
+                bounds,
+                ty,
+                default: None,
+            });
+            let p = self
+                .b
+                .resolved_path(self.name(), Ns::Type, Res::Local(binder));
+            let t = self.b.ty(Ty::Path(p));
+            self.tys.push(t);
+        }
+        let preds = if s.a % 4 == 0 {
+            let subject = hir_lang::Bound::Ty(self.ty());
+            let bounds = self.bounds(1, s.b);
+            self.b.list(&[hir_lang::WherePred { subject, bounds }])
+        } else {
+            hir_lang::List::EMPTY
+        };
+        hir_lang::Generics {
+            params: self.b.list(&params),
+            preds,
+        }
+    }
+
+    /// HIR v3 forms and the generic and interface forms.
+    #[allow(clippy::too_many_lines)]
+    fn v3_step(&mut self, kind: u8, s: &RawStep) {
+        match kind {
+            48 => {
+                // A generic function over the pending parameters.
+                let generics = self.generics(s);
+                let params = Self::take_tail(&mut self.params, s.a % 3);
+                let params = self.b.list(&params);
+                let ret = (s.c % 2 == 0).then(|| self.ty());
+                let body = Some(self.expr());
+                let item = self.b.item(Item::new(
+                    Some(self.name()),
+                    ItemKind::Fn(FnDef {
+                        generics,
+                        params,
+                        ret,
+                        body,
+                        ..FnDef::default()
+                    }),
+                ));
+                self.item(item);
+            }
+            49 => {
+                // An interface with members, supertraits, and an associated
+                // type.
+                let generics = self.generics(s);
+                let mut members = Self::take_tail(&mut self.items, s.a % 2);
+                if s.c % 2 == 0 {
+                    let bounds = self.bounds(s.b, s.a);
+                    let default = (s.a % 3 == 0).then(|| self.ty());
+                    let a = self.b.item(Item::new(
+                        Some(self.name()),
+                        ItemKind::AssocType { bounds, default },
+                    ));
+                    members.push(a);
+                }
+                let supers: Vec<TyId> = (0..s.b % 2)
+                    .map(|_| {
+                        let p = self.path(Ns::Type, s.c);
+                        self.b.ty(Ty::Path(p))
+                    })
+                    .collect();
+                let items = self.b.list(&members);
+                let supers = self.b.list(&supers);
+                let item = self.b.item(Item::new(
+                    Some(self.name()),
+                    ItemKind::Interface(hir_lang::InterfaceDef {
+                        generics,
+                        supers,
+                        items,
+                    }),
+                ));
+                self.item(item);
+            }
+            50 => {
+                // An impl of an interface, possibly generic.
+                let generics = self.generics(s);
+                let self_ty = self.ty();
+                let p = self.path(Ns::Type, s.a);
+                let iface = (s.c % 3 != 0).then(|| self.b.ty(Ty::Path(p)));
+                let mut members = Self::take_tail(&mut self.items, s.a % 3);
+                if s.b % 2 == 0 {
+                    let t = self.ty();
+                    let a = self.b.item(Item::new(
+                        Some(self.name()),
+                        ItemKind::Alias {
+                            generics: hir_lang::Generics::default(),
+                            ty: t,
+                        },
+                    ));
+                    members.push(a);
+                }
+                let items = self.b.list(&members);
+                let item = self.b.item(Item::new(
+                    None,
+                    ItemKind::Impl(ImplDef {
+                        generics,
+                        interface: iface,
+                        self_ty,
+                        items,
+                    }),
+                ));
+                self.item(item);
+            }
+            51 => {
+                let (a, b) = (self.ty(), self.ty());
+                let l = self.b.list(&[a, b]);
+                let t = self.b.ty(if s.a % 2 == 0 {
+                    Ty::Union(l)
+                } else {
+                    Ty::Intersection(l)
+                });
+                self.tys.push(t);
+            }
+            52 => {
+                let bounds = self.bounds(1 + s.b % 2, s.a);
+                let t = self.b.ty(if s.c % 2 == 0 {
+                    Ty::Object(bounds)
+                } else {
+                    Ty::Impl(bounds)
+                });
+                self.tys.push(t);
+            }
+            53 => {
+                // A path type with generic arguments (and an associated-type
+                // binding or a constant).
+                let mut args = alloc_args(s);
+                let fill: Vec<hir_lang::GenericArg> = args
+                    .drain(..)
+                    .map(|k| match k {
+                        0 => hir_lang::GenericArg::Ty(self.ty()),
+                        1 => hir_lang::GenericArg::Const(self.b.int(i64::from(s.c % 5))),
+                        _ => hir_lang::GenericArg::Binding {
+                            name: self.ident(0),
+                            ty: self.ty(),
+                        },
+                    })
+                    .collect();
+                let args = self.b.list(&fill);
+                let res = match s.a % 3 {
+                    0 if !self.all_items.is_empty() => {
+                        let item = self.all_items[usize::from(s.b) % self.all_items.len()];
+                        Res::Def(self.b.def(Def::Item(item)))
+                    }
+                    1 if !self.binders.is_empty() => {
+                        Res::Local(self.binders[usize::from(s.b) % self.binders.len()])
+                    }
+                    _ => Res::Extern(self.sym),
+                };
+                let origin = self.b.origin();
+                let seg = hir_lang::Segment {
+                    args,
+                    ..hir_lang::Segment::new(self.name(), origin)
+                };
+                let segs = if s.c % 4 == 0 {
+                    vec![hir_lang::Segment::new(self.name(), origin), seg]
+                } else {
+                    vec![seg]
+                };
+                let unresolved = u32::from(segs.len() == 2);
+                let segments = self.b.list(&segs);
+                let p = self.b.path(hir_lang::Path {
+                    res,
+                    unresolved,
+                    ..hir_lang::Path::new(segments, Ns::Type)
+                });
+                let t = self.b.ty(Ty::Path(p));
+                self.tys.push(t);
+            }
+            54 => {
+                let binder = self.binder(BinderKind::Place);
+                let (place, body) = (self.expr(), self.expr());
+                let e = self.b.expr(Expr::LetPlace {
+                    binder,
+                    place,
+                    body,
+                });
+                self.exprs.push(e);
+            }
+            55 => {
+                let e = self.expr();
+                let e = if s.a % 2 == 0 {
+                    self.b.expr(Expr::YieldFrom(e))
+                } else {
+                    let key = Some(self.expr());
+                    self.b.expr(Expr::Yield {
+                        key,
+                        value: Some(e),
+                    })
+                };
+                self.exprs.push(e);
+            }
+            56 => {
+                let kind = if s.a % 2 == 0 {
+                    OpKind::BitNot
+                } else {
+                    OpKind::Pow
+                };
+                let args: Vec<ExprId> = (0..kind.arity()).map(|_| self.expr()).collect();
+                let e = self.b.op(kind, &args);
+                self.exprs.push(e);
+            }
+            57 => {
+                // A generic record or sum.
+                let generics = self.generics(s);
+                let t = self.ty();
+                let f = self.b.field(FieldDef {
+                    ty: Some(t),
+                    ..FieldDef::named(self.ident(0))
+                });
+                let fields = self.b.list(&[f]);
+                let item = self.b.item(Item::new(
+                    Some(self.name()),
+                    ItemKind::Record(RecordDef {
+                        generics,
+                        fields,
+                        ..RecordDef::default()
+                    }),
+                ));
+                self.item(item);
+            }
+            58 => {
+                // A method call with generic arguments, or `T::name`.
+                let receiver = self.expr();
+                let t = self.ty();
+                let ga = self.b.list(&[hir_lang::GenericArg::Ty(t)]);
+                let args: Vec<Arg> = self.exprs(s.a).into_iter().map(Arg::positional).collect();
+                let args = self.b.list(&args);
+                let e = if s.b % 2 == 0 {
+                    self.b.expr(Expr::MethodCall {
+                        receiver,
+                        method: self.ident(0),
+                        generic_args: ga,
+                        args,
+                    })
+                } else {
+                    let origin = self.b.origin();
+                    let segments = self.b.list(&[
+                        hir_lang::Segment::new(self.name(), origin),
+                        hir_lang::Segment::new(self.name(), origin),
+                    ]);
+                    let res = match s.c % 2 {
+                        0 if !self.binders.is_empty() => {
+                            Res::Local(self.binders[usize::from(s.a) % self.binders.len()])
+                        }
+                        _ if !self.all_items.is_empty() => {
+                            let item = self.all_items[usize::from(s.a) % self.all_items.len()];
+                            Res::Def(self.b.def(Def::Item(item)))
+                        }
+                        _ => Res::Extern(self.sym),
+                    };
+                    let p = self.b.path(hir_lang::Path {
+                        res,
+                        unresolved: 1,
+                        ..hir_lang::Path::new(segments, Ns::Value)
+                    });
+                    self.b.expr(Expr::Path(p))
+                };
+                self.exprs.push(e);
+            }
+            59 => {
+                // A generic sum with a type-parameter field.
+                let generics = self.generics(s);
+                let t = self.ty();
+                let f = self.b.field(FieldDef {
+                    name: None,
+                    vis: hir_lang::Vis::Private,
+                    ty: Some(t),
+                    default: None,
+                });
+                let fields = self.b.list(&[f]);
+                let (n0, n1) = (self.ident(0), self.ident(1));
+                let v = self.b.variant(Variant {
+                    name: n0,
+                    shape: hir_lang::Shape::Tuple,
+                    fields,
+                    discriminant: None,
+                });
+                let u = self.b.variant(Variant {
+                    name: n1,
+                    shape: hir_lang::Shape::Unit,
+                    fields: hir_lang::List::EMPTY,
+                    discriminant: None,
+                });
+                let variants = self.b.list(&[v, u]);
+                let item = self.b.item(Item::new(
+                    Some(self.name()),
+                    ItemKind::Sum(SumDef { generics, variants }),
+                ));
+                self.item(item);
+            }
+            60 => {
+                // A range or or-pattern (for exhaustiveness).
+                let p = if s.a % 2 == 0 {
+                    let lo = self
+                        .b
+                        .pat(Pat::Lit(Lit::Int(hir_lang::IntLit::new(u64::from(s.b)))));
+                    let hi = self
+                        .b
+                        .pat(Pat::Lit(Lit::Int(hir_lang::IntLit::new(u64::from(s.c)))));
+                    self.b.pat(Pat::Range {
+                        lo: Some(lo),
+                        hi: Some(hi),
+                        inclusive: s.c % 2 == 0,
+                    })
+                } else {
+                    let (x, y) = (self.pat(), self.pat());
+                    let l = self.b.list(&[x, y]);
+                    self.b.pat(Pat::Or(l))
+                };
+                self.pats.push(p);
+            }
+            _ => {
+                // An intrinsic named like the `?` hook.
+                let arg = self.expr();
+                let args = self.b.list(&[arg]);
+                let e = self.b.expr(Expr::Intrinsic {
+                    kind: hir_lang::Intrinsic::Named(self.sym),
+                    generic_args: hir_lang::List::EMPTY,
+                    args,
+                });
+                self.exprs.push(e);
+            }
         }
     }
 
@@ -351,7 +718,10 @@ impl Random {
                     2 => Expr::Await(e),
                     3 => Expr::Spawn(e),
                     4 => Expr::Throw(e),
-                    _ => Expr::Yield(Some(e)),
+                    _ => Expr::Yield {
+                        key: None,
+                        value: Some(e),
+                    },
                 })
             }
             _ => {
@@ -664,9 +1034,25 @@ proptest! {
             .with_numeric_widening(true)
             .with_null_safety(false)
             .with_string_add(true);
-        for profile in [Profile::static_explicit(), Profile::dynamic(), permissive] {
-            let a = check(&hir, &profile).unwrap();
-            let b = check(&hir, &profile).unwrap();
+        let inferred = Profile::static_inferred()
+            .with_try_hook(TryHook::Intrinsic { name: names.intern("g"), convert: None });
+        let interfaces = Profile::static_inferred()
+            .with_polymorphism(typeck_lang::Polymorphism::Interfaces)
+            .with_mono(typeck_lang::MonoPolicy::Selective { max_nodes: 8 });
+        for profile in [Profile::static_explicit(), Profile::dynamic(), permissive, inferred, interfaces] {
+            // A cyclic interface resolution (`impl<T: I> I for T`) is a
+            // budget error, deterministically; nothing else may fail.
+            let (a, b) = match (check(&hir, &profile), check(&hir, &profile)) {
+                (Ok(a), Ok(b)) => (a, b),
+                (Err(CheckError::BudgetExceeded { limit: Limit::TraitDepth }), Err(e2)) => {
+                    prop_assert_eq!(e2, CheckError::BudgetExceeded { limit: Limit::TraitDepth });
+                    continue;
+                }
+                (a, b) => {
+                    prop_assert!(false, "{:?} / {:?}", a.err(), b.err());
+                    continue;
+                }
+            };
             prop_assert_eq!(&a, &b);
             for &e in &live {
                 prop_assert!(a.expr(e).is_some(), "untyped live expression {:?}", e);
@@ -688,11 +1074,13 @@ proptest! {
         let Ok((hir, _)) = b.finish_lenient(root) else {
             return Ok(());
         };
-        let mut checker = Checker::new(&hir, Profile::static_explicit());
-        let _ = checker.set_budget(Budget { steps: limit, ..Budget::default() });
-        match checker.check() {
-            Ok(_) | Err(CheckError::BudgetExceeded { .. }) => {}
-            Err(other) => prop_assert!(false, "{other:?}"),
+        for profile in [Profile::static_explicit(), Profile::static_inferred()] {
+            let mut checker = Checker::new(&hir, profile);
+            let _ = checker.set_budget(Budget { steps: limit, ..Budget::default() });
+            match checker.check() {
+                Ok(_) | Err(CheckError::BudgetExceeded { .. }) => {}
+                Err(other) => prop_assert!(false, "{other:?}"),
+            }
         }
     }
 }
@@ -722,4 +1110,42 @@ fn test_arbitrary_hir_reaches_the_checker() {
     assert!(valid >= 390, "valid {valid}/400");
     assert!(rich >= 150, "rich {rich}/400");
     assert!(with_diags >= 150, "with diagnostics {with_diags}/400");
+}
+
+/// The generic and interface forms survive repair and reach the checker's
+/// new rules (not vacuous for the 0.3 forms).
+#[test]
+fn test_arbitrary_hir_reaches_the_generic_rules() {
+    use proptest::strategy::ValueTree;
+    let mut runner = proptest::test_runner::TestRunner::deterministic();
+    let strategy = raw_steps();
+    let (mut generic, mut impls, mut new_codes) = (0, 0, 0);
+    for _ in 0..600 {
+        let steps = strategy.new_tree(&mut runner).unwrap().current();
+        let mut names = intern_lang::Interner::new();
+        let (b, root) = arbitrary(&steps, &mut names);
+        let Ok((hir, _)) = b.finish_lenient(root) else {
+            continue;
+        };
+        let mut has_generic = false;
+        let mut has_impl = false;
+        hir_lang::walk(&hir, |n| {
+            if let NodeRef::Item(i) = n {
+                match hir.item(i).kind {
+                    ItemKind::Fn(d) if !d.generics.params.is_empty() => has_generic = true,
+                    ItemKind::Impl(d) if d.interface.is_some() => has_impl = true,
+                    _ => {}
+                }
+            }
+        });
+        generic += usize::from(has_generic);
+        impls += usize::from(has_impl);
+        if let Ok(typed) = check(&hir, &Profile::static_inferred()) {
+            let new = typed.diagnostics().iter().any(|d| d.kind.code() >= "T0040");
+            new_codes += usize::from(new);
+        }
+    }
+    assert!(generic >= 60, "generic functions in {generic}/600");
+    assert!(impls >= 60, "interface impls in {impls}/600");
+    assert!(new_codes >= 60, "0.3 diagnostics in {new_codes}/600");
 }

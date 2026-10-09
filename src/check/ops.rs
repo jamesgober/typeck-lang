@@ -168,7 +168,10 @@ impl Ctx<'_> {
             OpKind::Neg | OpKind::Abs => {
                 self.unary(kind, first, Want::Numeric { or_str: false }, a0)?
             }
-            OpKind::Not => self.unary(kind, first, Want::IntOrBool, a0)?,
+            // HIR v3: `not` is logical, `bit_not` bitwise (spec section 12).
+            OpKind::Not => self.unary(kind, first, Want::Bool, a0)?,
+            OpKind::BitNot => self.unary(kind, first, Want::Int, a0)?,
+            OpKind::Pow => self.binary(kind, args, Want::Numeric { or_str: false }, a0)?,
             OpKind::Sqrt
             | OpKind::Floor
             | OpKind::Ceil
@@ -376,7 +379,9 @@ impl Ctx<'_> {
             (Type::Prim(Prim::Bool | Prim::Char), Type::Prim(p)) if p.is_int() => true,
             (Type::Prim(Prim::U8), Type::Prim(Prim::Char)) => true,
             (_, Type::Nullable(inner)) => self.unify(from, inner)?,
-            (Type::Adt(a), Type::Adt(b)) => self.is_subclass(a, b)? || self.is_subclass(b, a)?,
+            (Type::Adt { .. }, Type::Adt { .. }) => {
+                self.upcast(from, to)? || self.upcast(to, from)?
+            }
             _ => numeric(self, from) && numeric(self, to),
         })
     }

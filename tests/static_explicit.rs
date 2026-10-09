@@ -256,7 +256,9 @@ fn test_records_fields_and_literals() {
     let typed = static_check(&hir);
     assert_eq!(messages(&typed, &names), ["T0012 `Point` has no field `z`"]);
     assert_eq!(typed.expr(fx), Some(F64));
-    assert!(matches!(typed.types().get(typed.expr(lit).unwrap()), Type::Adt(i) if i == point));
+    assert!(
+        matches!(typed.types().get(typed.expr(lit).unwrap()), Type::Adt { item: i, .. } if i == point)
+    );
 }
 
 #[test]
@@ -406,7 +408,10 @@ fn test_sum_variants_match_and_exhaustiveness() {
     let partial = k.func("partial", &[ps2], None, body2);
     let (hir, names) = k.finish_items(&[shape, area, partial]);
     let typed = static_check(&hir);
-    assert_eq!(messages(&typed, &names), ["T0027 non-exhaustive match"]);
+    assert_eq!(
+        messages(&typed, &names),
+        ["T0027 non-exhaustive match: `Empty` not covered"]
+    );
     assert_eq!(
         typed.diagnostics()[0].kind,
         DiagnosticKind::NonExhaustive {
@@ -664,7 +669,8 @@ fn test_deferred_initialization_is_inferred() {
     let typed = static_check(&hir);
     assert!(typed.is_ok());
     assert_eq!(typed.binder(x), Some(BOOL));
-    assert_eq!(typed.expr(assign), Some(TypeId::UNIT));
+    // HIR v3: an assignment evaluates to the value stored.
+    assert_eq!(typed.expr(assign), Some(BOOL));
 }
 
 #[test]
@@ -743,7 +749,7 @@ fn test_dynamic_forms_and_any_values_are_rejected_statically() {
 }
 
 #[test]
-fn test_generics_are_reported_once_as_unsupported() {
+fn test_generic_function_is_instantiated_at_its_call() {
     let mut k = Kit::new();
     let t = k.name("T");
     let tb = k.b.new_binder(t, hir_lang::BinderKind::TypeParam);
@@ -779,10 +785,13 @@ fn test_generics_are_reported_once_as_unsupported() {
     let main_body = k.block(&[s], None);
     let (hir, names) = k.finish_main(&[id], main_body);
     let typed = static_check(&hir);
-    assert_eq!(
-        messages(&typed, &names),
-        ["T0028 generics are not supported by this profile in this version"]
-    );
+    assert!(typed.is_ok(), "{:?}", messages(&typed, &names));
+    assert_eq!(typed.expr(call), Some(TypeId::prim(Prim::I64)));
+    let inst = typed
+        .instantiation(typed_callee(&hir, call))
+        .expect("instantiation");
+    assert_eq!(inst.item, id);
+    assert_eq!(inst.args, &[TypeId::prim(Prim::I64)]);
     // Inside the item, the parameter is a rigid type.
     assert!(matches!(typed.types().get(typed.binder(x).unwrap()), Type::Param(b) if b == tb));
 }
@@ -894,4 +903,12 @@ fn test_let_else_must_diverge() {
         messages(&typed, &names),
         ["T0001 mismatched types: expected `!`, found `()`"]
     );
+}
+
+/// The callee expression of a call.
+fn typed_callee(hir: &hir_lang::Hir, call: hir_lang::ExprId) -> hir_lang::ExprId {
+    match *hir.expr(call) {
+        Expr::Call { callee, .. } => callee,
+        _ => call,
+    }
 }

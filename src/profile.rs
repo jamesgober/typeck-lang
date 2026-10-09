@@ -5,7 +5,9 @@
 //! discipline. One checker reads the profile; no language gets its own
 //! checker.
 
-use hir_lang::Prim;
+use hir_lang::{Prim, Symbol};
+
+use crate::mono::MonoPolicy;
 
 /// How much a language checks statically, and how much it infers.
 ///
@@ -13,13 +15,18 @@ use hir_lang::Prim;
 /// |---|---|---|---|
 /// | `Dynamic` | Python, Lua, Mox | Only statically certain arity and shape errors | none: every value is `any` |
 /// | `Gradual` | TypeScript, Mercury | Where annotated; `any` at the boundaries | local |
-/// | `StaticExplicit` | C, Go, Zero | Everything | `let` initializers and literals only |
-/// | `StaticInferred` | Kraken, Iron | Everything | bidirectional, generics, traits |
+/// | `StaticExplicit` | C, Go, Zero | Everything | `let` initializers, literals, generic arguments |
+/// | `StaticInferred` | Kraken, Iron | Everything | bidirectional: also closure signatures from context |
 /// | `Hm` | ML family | Everything | full, with let-polymorphism |
 ///
-/// Implemented in 0.2.0: `Dynamic` and `StaticExplicit`. The others are
-/// designed (see the crate's `dev/ROADMAP.md`) and land in 0.5.0; checking
-/// under them returns
+/// Both static disciplines check generic items, interfaces (traits), `impl`
+/// blocks, associated types, and `dyn`/`impl Trait` types: any HIR that uses
+/// them needs them. `StaticInferred` additionally infers unannotated closure
+/// parameters and results from the expected function type, or from use.
+///
+/// Implemented in 0.3.0: `Dynamic`, `StaticExplicit`, and `StaticInferred`.
+/// `Gradual` and `Hm` are designed (see the crate's `dev/ROADMAP.md`) and
+/// land in 0.5.0; checking under them returns
 /// [`CheckError::NotImplemented`](crate::CheckError::NotImplemented).
 ///
 /// # Examples
@@ -28,6 +35,7 @@ use hir_lang::Prim;
 /// use typeck_lang::Discipline;
 ///
 /// assert!(Discipline::Dynamic.is_implemented());
+/// assert!(Discipline::StaticInferred.is_implemented());
 /// assert!(!Discipline::Hm.is_implemented());
 /// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -58,7 +66,10 @@ impl Discipline {
     /// ```
     #[must_use]
     pub const fn is_implemented(self) -> bool {
-        matches!(self, Self::Dynamic | Self::StaticExplicit)
+        matches!(
+            self,
+            Self::Dynamic | Self::StaticExplicit | Self::StaticInferred
+        )
     }
 
     /// The discipline's name as profiles spell it (`static-explicit`).
@@ -103,8 +114,14 @@ pub enum RecordTyping {
     Structural,
 }
 
-/// How a language attaches behaviour to types (consulted by the 0.5
-/// `StaticInferred` and `Hm` disciplines).
+/// How a language attaches behaviour to types.
+///
+/// All three resolve members through the same engine (`impl` blocks and
+/// classes' declared interfaces are both implementations). The difference is
+/// what an interface name means where a type is expected: with
+/// `Interfaces`, the interface type (a `dyn` value, as in Java or Kraken);
+/// with `Traits` and `Typeclasses`, an error (write `dyn Trait` or
+/// `impl Trait`).
 ///
 /// # Examples
 ///
@@ -122,6 +139,63 @@ pub enum Polymorphism {
     Interfaces,
     /// Dictionary-passing typeclasses (Haskell).
     Typeclasses,
+}
+
+/// What `let x = null` (no annotation) gives `x` (ISSUES P17).
+///
+/// # Examples
+///
+/// ```
+/// use typeck_lang::NullLet;
+///
+/// assert_ne!(NullLet::NullType, NullLet::Nullable);
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum NullLet {
+    /// The type of the literal, `null`: the variable can only ever hold
+    /// `null` (the 0.2 convention).
+    NullType,
+    /// `T?` for a `T` inferred from the variable's later uses (an
+    /// assignment `x = 5` makes it `i64?`). Under a profile without null
+    /// safety, `T` itself.
+    Nullable,
+}
+
+/// How `?`-style error propagation reaches the checker.
+///
+/// HIR lowers `e?` as a template (`match e { Ok(v) => v, Err(x) => return
+/// Err(x) }`, spec section 8.7), which needs no hook: it is ordinary code. A
+/// language whose lowering keeps `?` as a named intrinsic instead gets it
+/// typed here: the operand is a *carrier* (a nullable `T?`, or a sum of two
+/// variants that is either option-like, one unit variant and one with a
+/// single field, or result-like, two single-field variants with the success
+/// variant first); the expression has the success value's type, and the
+/// enclosing function must return a carrier of the same kind whose failure
+/// type the operand's failure converts to.
+///
+/// # Examples
+///
+/// ```
+/// use typeck_lang::TryHook;
+///
+/// assert_eq!(TryHook::default(), TryHook::Template);
+/// ```
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum TryHook {
+    /// `?` arrives lowered as a `match`; nothing special.
+    #[default]
+    Template,
+    /// `Intrinsic::Named(name)` with one operand is `?`.
+    Intrinsic {
+        /// The intrinsic's name.
+        name: Symbol,
+        /// An interface (by name, among this unit's interfaces) whose
+        /// implementation `impl Conv<E1> for E2` lets a failure of type `E1`
+        /// propagate out of a function failing with `E2` (Rust's `From`).
+        /// `None`: the failure types must be equal.
+        convert: Option<Symbol>,
+    },
 }
 
 /// A type-system profile.
@@ -162,7 +236,8 @@ pub struct Profile {
     pub null_safety: bool,
     /// `match` must cover every value of the scrutinee's type.
     pub exhaustive_match: bool,
-    /// Traits, interfaces, or typeclasses (0.5 disciplines).
+    /// Traits, interfaces, or typeclasses: what an interface name means as
+    /// a type.
     pub polymorphism: Polymorphism,
     /// The type of an unsuffixed integer literal that nothing constrains.
     pub default_int: Prim,
@@ -175,6 +250,18 @@ pub struct Profile {
     /// function, an unknown named argument or record field, a constructor
     /// pattern of the wrong length).
     pub certain_errors: bool,
+    /// Method receivers are borrowed (`&x`, `&mut x`) and dereferenced
+    /// implicitly to fit the method's receiver parameter, and lookup looks
+    /// through references (Rust, Iron). When `false`, the receiver must
+    /// already have the receiver parameter's type.
+    pub method_autoref: bool,
+    /// Which generic items the monomorphization plan copies per
+    /// instantiation and which it shares through dictionary passing.
+    pub mono: MonoPolicy,
+    /// What `let x = null` gives `x`.
+    pub null_let: NullLet,
+    /// How `?` reaches the checker.
+    pub try_hook: TryHook,
 }
 
 impl Default for Profile {
@@ -210,6 +297,10 @@ impl Profile {
             default_float: Prim::F64,
             string_add: true,
             certain_errors: true,
+            method_autoref: true,
+            mono: MonoPolicy::Shared,
+            null_let: NullLet::NullType,
+            try_hook: TryHook::Template,
         }
     }
 
@@ -260,25 +351,35 @@ impl Profile {
             default_float: Prim::F64,
             string_add: false,
             certain_errors: true,
+            method_autoref: true,
+            mono: MonoPolicy::Copy,
+            null_let: NullLet::NullType,
+            try_hook: TryHook::Template,
         }
     }
 
-    /// Kraken, Iron: bidirectional inference, generics, traits (0.5).
+    /// Kraken, Iron: bidirectional inference, generics, traits.
+    ///
+    /// As [`static_explicit`](Self::static_explicit), with traits, closure
+    /// signatures inferred from context, and `let x = null` giving a nullable
+    /// type inferred from later uses.
     ///
     /// # Examples
     ///
     /// ```
-    /// use typeck_lang::{Discipline, Polymorphism, Profile};
+    /// use typeck_lang::{Discipline, NullLet, Polymorphism, Profile};
     ///
     /// let p = Profile::static_inferred();
     /// assert_eq!(p.discipline, Discipline::StaticInferred);
     /// assert_eq!(p.polymorphism, Polymorphism::Traits);
+    /// assert_eq!(p.null_let, NullLet::Nullable);
     /// ```
     #[must_use]
     pub const fn static_inferred() -> Self {
         Self {
             discipline: Discipline::StaticInferred,
             polymorphism: Polymorphism::Traits,
+            null_let: NullLet::Nullable,
             ..Self::static_explicit()
         }
     }
@@ -433,8 +534,76 @@ impl Profile {
         self
     }
 
+    /// Sets [`method_autoref`](Self::method_autoref).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// assert!(!typeck_lang::Profile::static_inferred().with_method_autoref(false).method_autoref);
+    /// ```
+    #[must_use]
+    pub const fn with_method_autoref(mut self, on: bool) -> Self {
+        self.method_autoref = on;
+        self
+    }
+
+    /// Sets [`mono`](Self::mono).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use typeck_lang::{MonoPolicy, Profile};
+    ///
+    /// let iron = Profile::static_inferred().with_mono(MonoPolicy::Selective { max_nodes: 64 });
+    /// assert_eq!(iron.mono, MonoPolicy::Selective { max_nodes: 64 });
+    /// ```
+    #[must_use]
+    pub const fn with_mono(mut self, mono: MonoPolicy) -> Self {
+        self.mono = mono;
+        self
+    }
+
+    /// Sets [`null_let`](Self::null_let).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use typeck_lang::{NullLet, Profile};
+    ///
+    /// let p = Profile::static_explicit().with_null_let(NullLet::Nullable);
+    /// assert_eq!(p.null_let, NullLet::Nullable);
+    /// ```
+    #[must_use]
+    pub const fn with_null_let(mut self, null_let: NullLet) -> Self {
+        self.null_let = null_let;
+        self
+    }
+
+    /// Sets [`try_hook`](Self::try_hook).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use intern_lang::Interner;
+    /// use typeck_lang::{Profile, TryHook};
+    ///
+    /// let mut names = Interner::new();
+    /// let hook = TryHook::Intrinsic { name: names.intern("try"), convert: None };
+    /// assert_eq!(Profile::static_inferred().with_try_hook(hook).try_hook, hook);
+    /// ```
+    #[must_use]
+    pub const fn with_try_hook(mut self, hook: TryHook) -> Self {
+        self.try_hook = hook;
+        self
+    }
+
     /// Whether the static rules apply (every discipline but `Dynamic`).
     pub(crate) const fn is_static(&self) -> bool {
         !matches!(self.discipline, Discipline::Dynamic)
+    }
+
+    /// Whether unannotated closure signatures are inferred.
+    pub(crate) const fn infers_closures(&self) -> bool {
+        matches!(self.discipline, Discipline::StaticInferred | Discipline::Hm)
     }
 }

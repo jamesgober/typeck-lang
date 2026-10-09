@@ -293,13 +293,32 @@ impl Infer {
                     }
                 }
                 // `{error}` equals everything, but is never merged with a
-                // non-variable class: that would poison a shared term.
-                (Tag::Error, _) | (_, Tag::Error) => {}
+                // non-variable class: that would poison a shared term. The
+                // variables inside the other side become `{error}` too (they
+                // stand for parts of something already reported), each
+                // node once.
+                (Tag::Error, _) | (_, Tag::Error) => {
+                    let other = if na.tag == Tag::Error { tb } else { ta };
+                    if types.node(other).has_var
+                        && self.assumed.insert((other.raw(), TypeId::ERROR.raw()))
+                    {
+                        let work = &mut self.work;
+                        types.for_each_child(other, |k| work.push((k, TypeId::ERROR)));
+                    }
+                }
                 // Structural equality with a nominal record: compare fields,
                 // but never merge the nominal type's class (it would then
                 // stand for the other type everywhere). Pairs already being
                 // compared in this call are assumed equal, which is what
                 // makes recursive records terminate (coinduction).
+                // Two instances of one nominal item: equal when their
+                // arguments are.
+                (Tag::Adt, Tag::Adt) if na.x == nb.x => {
+                    if !self.decompose(types, cfg, ta, tb)? {
+                        return Ok(false);
+                    }
+                    self.link(ra, rb, prefer_ground(types, ta, tb).raw(), GENERAL);
+                }
                 (Tag::Adt, _) | (_, Tag::Adt) => {
                     let pair = (ta.raw().min(tb.raw()), ta.raw().max(tb.raw()));
                     if self.assumed.insert(pair) && !self.decompose(types, cfg, ta, tb)? {
@@ -310,7 +329,7 @@ impl Infer {
                     if !self.decompose(types, cfg, ta, tb)? {
                         return Ok(false);
                     }
-                    self.link(ra, rb, ta.raw(), GENERAL);
+                    self.link(ra, rb, prefer_ground(types, ta, tb).raw(), GENERAL);
                 }
             }
         }
@@ -354,10 +373,12 @@ impl Infer {
         b: TypeId,
     ) -> Result<bool, CheckError> {
         let (na, nb) = (types.node(a), types.node(b));
-        if na.tag == Tag::Adt
-            || nb.tag == Tag::Adt
-            || na.tag == Tag::Record
-            || nb.tag == Tag::Record
+        let same_adt = na.tag == Tag::Adt && nb.tag == Tag::Adt && na.x == nb.x;
+        if !same_adt
+            && (na.tag == Tag::Adt
+                || nb.tag == Tag::Adt
+                || na.tag == Tag::Record
+                || nb.tag == Tag::Record)
         {
             return Ok(self.decompose_records(types, cfg, a, b));
         }
@@ -365,6 +386,28 @@ impl Infer {
             return Ok(false);
         }
         match na.tag {
+            // Applied nominal types, interface references, projections,
+            // opaque types, unions, intersections, and trait objects: equal
+            // heads, then equal children in order. Unions and intersections
+            // are kept sorted, so variable-free ones compare by id before
+            // getting here; with variables inside, members are paired in
+            // their stored order.
+            Tag::Adt
+            | Tag::Foreign
+            | Tag::Extern
+            | Tag::Trait
+            | Tag::Proj
+            | Tag::Opaque
+            | Tag::Union
+            | Tag::Inter
+            | Tag::Dyn => {
+                if na.x != nb.x || na.y != nb.y || na.z != nb.z {
+                    return Ok(false);
+                }
+                let (ka, kb) = (types.kids_of(&na), types.kids_of(&nb));
+                self.work.extend(ka.iter().copied().zip(kb.iter().copied()));
+                Ok(true)
+            }
             Tag::Tuple | Tag::Fn => {
                 let (ka, kb) = (types.kids_of(&na), types.kids_of(&nb));
                 self.work.extend(ka.iter().copied().zip(kb.iter().copied()));
@@ -374,12 +417,11 @@ impl Infer {
                 }
                 Ok(true)
             }
-            Tag::Array => {
-                if na.y != nb.y || na.z != nb.z {
-                    return Ok(false);
-                }
+            Tag::Array | Tag::Map => {
                 self.work
                     .push((TypeId::from_raw(na.x), TypeId::from_raw(nb.x)));
+                self.work
+                    .push((TypeId::from_raw(na.y), TypeId::from_raw(nb.y)));
                 Ok(true)
             }
             Tag::Slice
@@ -392,13 +434,6 @@ impl Infer {
             | Tag::AsyncGen => {
                 self.work
                     .push((TypeId::from_raw(na.x), TypeId::from_raw(nb.x)));
-                Ok(true)
-            }
-            Tag::Map => {
-                self.work
-                    .push((TypeId::from_raw(na.x), TypeId::from_raw(nb.x)));
-                self.work
-                    .push((TypeId::from_raw(na.y), TypeId::from_raw(nb.y)));
                 Ok(true)
             }
             // Leaves are interned: distinct ids are distinct types.
@@ -663,6 +698,18 @@ impl Infer {
         } else {
             Ok(())
         }
+    }
+}
+
+/// Of two equal non-variable nodes, the one to represent their class: a
+/// variable-free node when there is one, so a variable-free type resolves
+/// to itself (or to an equally variable-free node) and its flags describe
+/// what it reaches.
+fn prefer_ground(types: &Types, a: TypeId, b: TypeId) -> TypeId {
+    if types.node(a).has_var && !types.node(b).has_var {
+        b
+    } else {
+        a
     }
 }
 

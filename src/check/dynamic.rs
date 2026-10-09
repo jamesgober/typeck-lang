@@ -40,6 +40,7 @@ impl Ctx<'_> {
                 }
             };
             match *hir.expr(e) {
+                Expr::LetPlace { binder, .. } => bind(binder),
                 Expr::Closure(c) => {
                     hir.list(c.captures).iter().for_each(|cap| bind(cap.binder));
                     c.self_binder.into_iter().for_each(&mut bind);

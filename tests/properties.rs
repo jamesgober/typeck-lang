@@ -556,8 +556,8 @@ fn generate(choices: &[u8], mutation: Mutation) -> Program {
 /// Whether type `id` is the generator's type `t`.
 fn is(types: &Types, decls: &Decls, id: TypeId, t: &T) -> bool {
     match (types.get(id), t) {
-        (Type::Adt(i), T::Rec) => i == decls.rec,
-        (Type::Adt(i), T::Opt) => i == decls.opt,
+        (Type::Adt { item: i, .. }, T::Rec) => i == decls.rec,
+        (Type::Adt { item: i, .. }, T::Opt) => i == decls.opt,
         (Type::Prim(Prim::I32), T::I32)
         | (Type::Prim(Prim::I64), T::I64)
         | (Type::Prim(Prim::F64), T::F64)

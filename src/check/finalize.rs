@@ -11,19 +11,30 @@ use crate::{
     diag::DiagnosticKind,
     error::CheckError,
     infer::{FLOAT, GENERAL, INT},
-    typed::{NONE, OpClass, Stats, Typed},
+    mono::MonoPlan,
+    typed::{NONE, OpClass, Stats, Typed, WKind},
     types::{Tag, Type, TypeId},
 };
 
 impl Ctx<'_> {
     pub(crate) fn into_typed(mut self) -> Result<Typed, CheckError> {
         let mut op_classes = Vec::new();
+        let mut plan = MonoPlan::default();
         if self.profile.is_static() {
+            self.solve()?;
             self.default_literals();
+            // Goals that waited on literals.
+            let stuck = core::mem::take(&mut self.stuck);
+            self.pending.extend(stuck);
+            self.solve()?;
+            let rest = core::mem::take(&mut self.pending);
+            self.stuck = rest;
             self.recheck_deferred_ops()?;
             self.check_literal_ranges();
             self.report_unresolved()?;
             self.zonk_all()?;
+            self.check_matches()?;
+            plan = self.build_plan()?;
             self.collect_op_classes(&mut op_classes);
         } else {
             for &e in &self.idx.exprs {
@@ -39,8 +50,47 @@ impl Ctx<'_> {
         self.coercions.dedup_by_key(|c| c.0);
         self.methods.sort_by_key(|&(e, _)| e);
         self.methods.dedup_by_key(|m| m.0);
-        self.deferred.sort_unstable();
-        self.deferred.dedup();
+        // Uses by expression (the first recorded wins).
+        let mut insts = Vec::with_capacity(self.uses.len());
+        let mut inst_args = Vec::new();
+        let mut uses = core::mem::take(&mut self.uses);
+        uses.sort_by_key(|u| u.at);
+        uses.dedup_by_key(|u| u.at);
+        for u in &uses {
+            let args = self
+                .use_args
+                .get(u.args.0 as usize..(u.args.0 as usize).saturating_add(u.args.1 as usize))
+                .unwrap_or(&[]);
+            let start = u32::try_from(inst_args.len()).unwrap_or(NONE);
+            inst_args.extend_from_slice(args);
+            insts.push((u.at, u.callee, start, u.args.1, u.dispatch));
+        }
+        // Witnesses: by match, then in the order found; with the names of
+        // the variants and records they mention.
+        self.witnesses.sort_by_key(|&(e, _, _)| e);
+        let mut wnames = Vec::new();
+        let mut witems = Vec::new();
+        for n in &self.wnodes {
+            match n.kind {
+                WKind::Variant(v) => {
+                    if let Some(var) = self.hir.variant(v) {
+                        wnames.push((u32::try_from(v.index()).unwrap_or(NONE), var.name.sym));
+                    }
+                }
+                WKind::Item(i) => {
+                    if let Some(sym) = self.item_symbol(i) {
+                        witems.push((u32::try_from(i.index()).unwrap_or(NONE), sym));
+                    }
+                }
+                _ => {}
+            }
+        }
+        wnames.sort_unstable();
+        wnames.dedup_by_key(|w| w.0);
+        witems.sort_unstable();
+        witems.dedup_by_key(|w| w.0);
+        let mut opaque = core::mem::take(&mut self.hidden);
+        opaque.sort_by_key(|&(t, _)| t);
         let path_defs = self
             .path_def
             .iter()
@@ -60,7 +110,15 @@ impl Ctx<'_> {
             methods: self.methods,
             coercions: self.coercions,
             op_classes,
-            deferred: self.deferred,
+            insts,
+            inst_args,
+            mono: plan,
+            opaque,
+            witnesses: self.witnesses,
+            wnodes: self.wnodes,
+            wsyms: self.wsyms,
+            wnames,
+            witems,
             diagnostics: self.diags,
             profile: self.profile,
         })
@@ -143,6 +201,23 @@ impl Ctx<'_> {
             }
         }
         self.idx.exprs = exprs;
+        // Interface goals that never got a known type.
+        let stuck = core::mem::take(&mut self.stuck);
+        for ob in &stuck {
+            let ty = match ob.goal {
+                super::traits::Goal::Impl { ty, .. } | super::traits::Goal::Project { ty, .. } => {
+                    ty
+                }
+            };
+            if let Some(root) =
+                self.infer
+                    .first_free(&self.types, &mut memo, &mut self.meter, ty)?
+            {
+                if first_report(&mut reported, root) {
+                    self.report(ob.at, DiagnosticKind::CannotInfer);
+                }
+            }
+        }
         // Everything still unknown becomes `{error}`.
         let vars = core::mem::take(&mut self.infer.vars);
         for &v in &vars {
@@ -188,6 +263,30 @@ impl Ctx<'_> {
                 .zonk(&mut self.types, &mut memo, &mut self.meter, c.2)?;
         }
         self.coercions = coercions;
+        let mut args = core::mem::take(&mut self.use_args);
+        for a in &mut args {
+            *a = self
+                .infer
+                .zonk(&mut self.types, &mut memo, &mut self.meter, *a)?;
+        }
+        self.use_args = args;
+        let mut hidden = core::mem::take(&mut self.hidden);
+        for h in &mut hidden {
+            h.1 = self
+                .infer
+                .zonk(&mut self.types, &mut memo, &mut self.meter, h.1)?;
+        }
+        self.hidden = hidden;
+        let mut dyn_uses = core::mem::take(&mut self.dyn_uses);
+        for d in &mut dyn_uses {
+            d.1 = self
+                .infer
+                .zonk(&mut self.types, &mut memo, &mut self.meter, d.1)?;
+            d.2 = self
+                .infer
+                .zonk(&mut self.types, &mut memo, &mut self.meter, d.2)?;
+        }
+        self.dyn_uses = dyn_uses;
         let mut diags = core::mem::take(&mut self.diags);
         for d in &mut diags {
             let mut err = None;

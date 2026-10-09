@@ -96,7 +96,7 @@ impl Ctx<'_> {
         let r = self.value_path(path, at)?;
         Ok(match r {
             ValueRef::Error => None,
-            ValueRef::Decl(_) | ValueRef::Typed(_) => Some(self.value_type(r)?),
+            ValueRef::Decl { .. } | ValueRef::Typed(_) => Some(self.value_type(r)?),
             _ => {
                 self.report(at, DiagnosticKind::NotAValue);
                 None
@@ -281,18 +281,20 @@ impl Ctx<'_> {
     ) -> Result<(), CheckError> {
         let at = NodeRef::Pat(p);
         let elems = self.hir.list(elems);
+        if self.is_err(t) {
+            // The scrutinee was reported: its parts are `{error}` too.
+            let _ = self.value_path(path, at)?;
+            stack.extend(elems.iter().map(|&e| (e, TypeId::ERROR)));
+            return Ok(());
+        }
         let (fields, adt) = match self.value_path(path, at)? {
-            ValueRef::RecordCtor(i) => (self.record_field_ids(i), self.adt_type(i)),
-            ValueRef::VariantCtor(v) => {
+            ValueRef::RecordCtor { item, adt } => (self.record_field_ids(item), adt),
+            ValueRef::VariantCtor { v, adt } => {
                 let fields = self
                     .hir
                     .variant(v)
                     .map(|x| self.hir.list(x.fields).to_vec())
                     .unwrap_or_default();
-                let adt = self
-                    .hir
-                    .variant_owner(v)
-                    .map_or(TypeId::ERROR, |s| self.adt_type(s));
                 (fields, adt)
             }
             ValueRef::Error => {
@@ -316,7 +318,7 @@ impl Ctx<'_> {
         }
         let mut types = Vec::with_capacity(fields.len());
         for f in fields {
-            types.push(self.field_type(f)?);
+            types.push(self.field_type_in(f, adt)?);
         }
         self.push_with_rest(p, elems, rest, &types, stack);
         Ok(())
@@ -336,13 +338,20 @@ impl Ctx<'_> {
         let error_out = |stack: &mut Vec<(PatId, TypeId)>| {
             stack.extend(fps.iter().map(|fp| (fp.pat, TypeId::ERROR)));
         };
+        if self.is_err(t) {
+            if let Some(path) = path {
+                let _ = self.record_ref(path, at)?;
+            }
+            error_out(stack);
+            return Ok(());
+        }
         // Named targets: a record, class, or variant item.
         if let Some(path) = path {
             let Some(target) = self.record_ref(path, at)? else {
                 error_out(stack);
                 return Ok(());
             };
-            let adt = self.record_ref_type(target);
+            let adt = self.record_ref_type(target, Some(path));
             if !self.pat_fit(p, adt, t)? {
                 error_out(stack);
                 return Ok(());
@@ -360,7 +369,7 @@ impl Ctx<'_> {
                 match self.idx.field_named(owner, fp.name.sym) {
                     Some((_, f)) => {
                         mentioned += 1;
-                        let ft = self.field_type(f)?;
+                        let ft = self.field_type_in(f, adt)?;
                         stack.push((fp.pat, ft));
                     }
                     None => {
@@ -553,10 +562,41 @@ impl Ctx<'_> {
                 }
                 ok
             }
-            Type::Adt(a) => match self.types.get(self.resolve(target)) {
-                Type::Adt(b) => a == b || self.is_subclass(b, a)?,
+            Type::Adt { item: a, .. } => match self.types.get(self.resolve(target)) {
+                Type::Adt { item: b, .. } => a == b || self.is_subclass(b, a)?,
+                Type::Dyn(_) => true,
                 _ => false,
             },
+            // A union, intersection, interface, or placeholder value may be
+            // a value of any type related to it.
+            Type::Union(ms) => {
+                let ms = ms.to_vec();
+                let mut any = false;
+                for m in ms {
+                    let snap = self.infer.snapshot();
+                    let hit = self.unify(m, target)?
+                        || matches!(
+                            (
+                                self.types.get(self.resolve(m)),
+                                self.types.get(self.resolve(target))
+                            ),
+                            (Type::Adt { .. }, Type::Adt { .. })
+                        ) && self.upcast(target, m)?;
+                    self.infer.rollback(snap);
+                    if hit {
+                        any = true;
+                        break;
+                    }
+                }
+                any
+            }
+            Type::Intersection(_)
+            | Type::Dyn(_)
+            | Type::Param(_)
+            | Type::ImplParam(_)
+            | Type::SelfOf(_)
+            | Type::Opaque { .. }
+            | Type::Projection { .. } => true,
             _ => self.unify(s, target)?,
         };
         if !ok {
@@ -570,13 +610,6 @@ impl Ctx<'_> {
         }
         Ok(())
     }
-}
-
-/// One step of the irrefutability evaluation.
-enum Step {
-    Visit(PatId),
-    All(usize),
-    Any(usize),
 }
 
 impl Ctx<'_> {
@@ -601,149 +634,8 @@ impl Ctx<'_> {
     }
 
     /// A bare identifier pattern that binds (its path never resolved).
-    fn ident_binds(&self, path: PathId) -> bool {
+    pub(crate) fn ident_binds(&self, path: PathId) -> bool {
         let p = self.hir.path(path);
         p.res == Res::Unresolved && p.unresolved == 0
-    }
-
-    /// Whether a pattern matches every value of its type. Conservative: a
-    /// pattern on a sum variant is refutable even when the sum has one
-    /// variant.
-    pub(crate) fn irrefutable(&mut self, root: PatId) -> Result<bool, CheckError> {
-        let hir = self.hir;
-        let mut steps = alloc::vec![Step::Visit(root)];
-        let mut vals: Vec<bool> = Vec::new();
-        while let Some(step) = steps.pop() {
-            self.meter.tick(1)?;
-            match step {
-                Step::Visit(p) => match *hir.pat(p) {
-                    Pat::Wild | Pat::Err | Pat::Bind { sub: None, .. } => vals.push(true),
-                    Pat::Bind { sub: Some(s), .. } | Pat::Ref { inner: s, .. } => {
-                        steps.push(Step::Visit(s));
-                    }
-                    Pat::Ident { path, .. } => vals.push(self.ident_binds(path)),
-                    Pat::Lit(_) | Pat::Range { .. } | Pat::Path(_) | Pat::TypeTest { .. } => {
-                        vals.push(false);
-                    }
-                    Pat::Tuple { elems, .. } => {
-                        let elems = hir.list(elems);
-                        steps.push(Step::All(elems.len()));
-                        steps.extend(elems.iter().map(|&e| Step::Visit(e)));
-                    }
-                    Pat::Ctor { path, elems, .. } => {
-                        if self.variant_of_path(path).is_some() {
-                            vals.push(false);
-                        } else {
-                            let elems = hir.list(elems);
-                            steps.push(Step::All(elems.len()));
-                            steps.extend(elems.iter().map(|&e| Step::Visit(e)));
-                        }
-                    }
-                    Pat::Record { path, fields, .. } => {
-                        if path.is_some_and(|p| self.variant_of_path(p).is_some()) {
-                            vals.push(false);
-                        } else {
-                            let fields = hir.list(fields);
-                            steps.push(Step::All(fields.len()));
-                            steps.extend(fields.iter().map(|f| Step::Visit(f.pat)));
-                        }
-                    }
-                    Pat::Slice { prefix, rest } => {
-                        vals.push(prefix.is_empty() && rest.is_some_and(|r| r.suffix.is_empty()))
-                    }
-                    Pat::Or(alts) => {
-                        let alts = hir.list(alts);
-                        steps.push(Step::Any(alts.len()));
-                        steps.extend(alts.iter().map(|&a| Step::Visit(a)));
-                    }
-                },
-                Step::All(n) | Step::Any(n) => {
-                    let at = vals.len().saturating_sub(n);
-                    let all = matches!(step, Step::All(_));
-                    let v = if all {
-                        vals.get(at..).is_none_or(|s| s.iter().all(|&b| b))
-                    } else {
-                        vals.get(at..).is_some_and(|s| s.iter().any(|&b| b))
-                    };
-                    vals.truncate(at);
-                    vals.push(v);
-                }
-            }
-        }
-        Ok(vals.pop().unwrap_or(false))
-    }
-
-    /// How much of variant `v` a top-level arm pattern covers.
-    pub(crate) fn covers_variant(
-        &mut self,
-        root: PatId,
-        v: hir_lang::VariantId,
-    ) -> Result<super::engine::Cover, CheckError> {
-        use super::engine::Cover;
-        let hir = self.hir;
-        let mut best = Cover::None;
-        let mut stack = alloc::vec![root];
-        while let Some(p) = stack.pop() {
-            self.meter.tick(1)?;
-            let this = match *hir.pat(p) {
-                Pat::Wild | Pat::Err | Pat::Bind { sub: None, .. } => Cover::All,
-                Pat::Bind { sub: Some(s), .. } => {
-                    stack.push(s);
-                    continue;
-                }
-                Pat::Or(alts) => {
-                    stack.extend(hir.list(alts).iter().copied());
-                    continue;
-                }
-                Pat::Ident { path, .. } => {
-                    if self.ident_binds(path) || self.variant_of_path(path) == Some(v) {
-                        Cover::All
-                    } else {
-                        Cover::None
-                    }
-                }
-                Pat::Path(path) => {
-                    if self.variant_of_path(path) == Some(v) {
-                        Cover::All
-                    } else {
-                        Cover::None
-                    }
-                }
-                Pat::Ctor { path, elems, .. } => {
-                    if self.variant_of_path(path) == Some(v) {
-                        let mut all = true;
-                        for &e in hir.list(elems) {
-                            all &= self.irrefutable(e)?;
-                        }
-                        if all { Cover::All } else { Cover::Some }
-                    } else {
-                        Cover::None
-                    }
-                }
-                Pat::Record {
-                    path: Some(path),
-                    fields,
-                    ..
-                } => {
-                    if self.variant_of_path(path) == Some(v) {
-                        let mut all = true;
-                        for f in hir.list(fields) {
-                            all &= self.irrefutable(f.pat)?;
-                        }
-                        if all { Cover::All } else { Cover::Some }
-                    } else {
-                        Cover::None
-                    }
-                }
-                Pat::TypeTest { .. } => Cover::Some,
-                _ => Cover::None,
-            };
-            best = match (best, this) {
-                (Cover::All, _) | (_, Cover::All) => Cover::All,
-                (Cover::Some, _) | (_, Cover::Some) => Cover::Some,
-                _ => Cover::None,
-            };
-        }
-        Ok(best)
     }
 }

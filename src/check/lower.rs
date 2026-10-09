@@ -2,19 +2,21 @@
 //!
 //! Every lowering is memoized per HIR node (a type node sits in exactly one
 //! context, so its meaning is fixed) and iterative: a type nested 100,000
-//! deep lowers on an explicit stack.
+//! deep lowers on an explicit stack, including through generic arguments
+//! (`Vec<Vec<...>>`), which are children of their path.
 
 use alloc::vec::Vec;
 
 use hir_lang::{
-    Def, Effects, Expr, ExprId, FieldId, ItemId, ItemKind, Lit, NodeRef, OpKind, ParamKind, Pat,
-    PathId, Res, Symbol, Ty, TyId,
+    Bound, Def, Effects, Expr, ExprId, FieldId, GenericArg, ItemId, ItemKind, Lit, NodeRef, OpKind,
+    ParamKind, Pat, PathId, PathRoot, Res, Symbol, Ty, TyId,
 };
 
 use super::Ctx;
 use crate::{
     diag::{DiagnosticKind, Feature},
-    error::CheckError,
+    error::{CheckError, Limit},
+    profile::Polymorphism,
     typed::NONE,
     types::TypeId,
 };
@@ -95,6 +97,27 @@ impl Ctx<'_> {
         if let Some(t) = self.memo_ty(root) {
             return Ok(t);
         }
+        // Lowering re-enters itself only through defaults of generic
+        // parameters and associated types defined through other items; a
+        // cycle among those reaches this cap instead of the call stack's.
+        self.lower_depth = self.lower_depth.saturating_add(1);
+        let r = if self.lower_depth > self.nest_limit() {
+            Err(CheckError::BudgetExceeded {
+                limit: Limit::TraitDepth,
+            })
+        } else {
+            self.lower_ty_inner(root, self_ty, sig)
+        };
+        self.lower_depth = self.lower_depth.saturating_sub(1);
+        r
+    }
+
+    fn lower_ty_inner(
+        &mut self,
+        root: TyId,
+        self_ty: Option<TypeId>,
+        sig: bool,
+    ) -> Result<TypeId, CheckError> {
         // (node, children done, Self, declaration context)
         let mut stack: Vec<(TyId, bool, Option<TypeId>, bool)> =
             alloc::vec![(root, false, self_ty, sig)];
@@ -114,6 +137,15 @@ impl Ctx<'_> {
                                     *s = 1;
                                 }
                                 stack.push((ty, true, self_ty, sig));
+                                // The use's generic arguments, then the body
+                                // (in the alias's own placeholders).
+                                kids.clear();
+                                ty_children(&node, self.hir, &mut kids);
+                                for &k in kids.iter().rev() {
+                                    if self.memo_ty(k).is_none() {
+                                        stack.push((k, false, self_ty, sig));
+                                    }
+                                }
                                 let alias_self = self.item_self(alias);
                                 stack.push((body, false, alias_self, true));
                                 continue;
@@ -169,15 +201,29 @@ impl Ctx<'_> {
                 }
             }
             Ty::Prim(p) => TypeId::prim(p),
-            Ty::Path(p) => self.path_ty(id, p)?,
+            Ty::Path(p) => self.path_ty(id, p, self_ty, sig)?,
             Ty::Tuple(list) => {
                 let elems: Vec<TypeId> = self.hir.list(list).iter().map(|&t| self.sub(t)).collect();
                 self.types.tuple(&elems)
             }
+            Ty::Union(list) => {
+                let members: Vec<TypeId> =
+                    self.hir.list(list).iter().map(|&t| self.sub(t)).collect();
+                self.types.union(&members)
+            }
+            Ty::Intersection(list) => {
+                let members: Vec<TypeId> =
+                    self.hir.list(list).iter().map(|&t| self.sub(t)).collect();
+                self.types.intersection(&members)
+            }
             Ty::Array { elem, len } => {
                 let elem = self.sub(elem);
+                if let Some(b) = self.const_param_of(len) {
+                    let p = self.types.param(b);
+                    return Ok(self.types.array_of(elem, p));
+                }
                 match self.const_eval(len)? {
-                    Some(n) if n >= 0 => {
+                    Some(n) if n >= 0 && i64::try_from(n).is_ok() => {
                         self.types.array(elem, u64::try_from(n).unwrap_or(u64::MAX))
                     }
                     _ => {
@@ -215,16 +261,30 @@ impl Ctx<'_> {
             }
             Ty::Any => TypeId::ANY,
             Ty::Never => TypeId::NEVER,
-            Ty::Object(_) | Ty::Impl(_) => {
-                self.report(
-                    at,
-                    DiagnosticKind::Unsupported {
-                        feature: Feature::Traits,
-                    },
-                );
-                TypeId::ERROR
+            Ty::Object(bounds) => {
+                let bounds: Vec<TyId> = self
+                    .hir
+                    .list(bounds)
+                    .iter()
+                    .filter_map(|b| match *b {
+                        Bound::Ty(t) => Some(t),
+                        Bound::Region(_) => None,
+                    })
+                    .collect();
+                self.dyn_type(&bounds, at)?
             }
-            Ty::SelfTy => match self_ty {
+            Ty::Impl(_) => match self.impl_ty_owner(id) {
+                Some((f, true)) => {
+                    let params = self.placeholders(f);
+                    self.types.opaque(id, &params)
+                }
+                Some((_, false)) => self.types.impl_param(id),
+                None => {
+                    self.report(at, DiagnosticKind::ImplTraitPosition);
+                    TypeId::ERROR
+                }
+            },
+            Ty::SelfTy => match self_ty.or_else(|| self.ctx_self()) {
                 Some(t) => t,
                 None => {
                     self.report(at, DiagnosticKind::NotAType);
@@ -235,8 +295,70 @@ impl Ctx<'_> {
         })
     }
 
-    /// The alias item a type path names, with its aliased type, when that
-    /// alias can be expanded here (not generic).
+    /// `Self` in the item whose annotations are being lowered.
+    fn ctx_self(&self) -> Option<TypeId> {
+        let item = self.env_item()?;
+        match self.item_kind(item) {
+            ItemKind::Impl(_) | ItemKind::Class(_) | ItemKind::Interface(_) => self
+                .idx
+                .self_ty
+                .get(item.index())
+                .copied()
+                .filter(|&v| v != NONE)
+                .map(TypeId::from_raw),
+            _ => self.item_self(item),
+        }
+    }
+
+    /// A `dyn` type over the interfaces `bounds` names: each interface
+    /// reference carries the values of its associated types, which must all
+    /// be bound.
+    fn dyn_type(&mut self, bounds: &[TyId], at: NodeRef) -> Result<TypeId, CheckError> {
+        let mut traits = Vec::new();
+        for &b in bounds {
+            let Some(lb) = self.lower_bound(b, TypeId::ERROR)? else {
+                return Ok(TypeId::ERROR);
+            };
+            let Some(iface) = self.trait_item(lb.tr) else {
+                continue;
+            };
+            let mut args = self.trait_args(lb.tr);
+            for assoc in self.assoc_types(iface) {
+                match lb.bindings.iter().find(|&&(a, _)| a == assoc) {
+                    Some(&(_, v)) => args.push(v),
+                    None => {
+                        if let Some(name) = self.item_symbol(assoc) {
+                            self.report(at, DiagnosticKind::MissingAssocBinding { name });
+                        }
+                        args.push(TypeId::ERROR);
+                    }
+                }
+            }
+            traits.push(self.types.trait_ref(iface, &args));
+        }
+        Ok(self.types.dyn_of(&traits))
+    }
+
+    /// The constant parameter an array length names, if it names one.
+    fn const_param_of(&self, len: ExprId) -> Option<hir_lang::BinderId> {
+        let Expr::Path(p) = *self.hir.expr(len) else {
+            return None;
+        };
+        let path = self.hir.path(p);
+        match (path.unresolved, path.res) {
+            (0, Res::Local(b))
+                if self
+                    .hir
+                    .binder(b)
+                    .is_some_and(|x| x.kind == hir_lang::BinderKind::ConstParam) =>
+            {
+                Some(b)
+            }
+            _ => None,
+        }
+    }
+
+    /// The alias item a type path names, with its aliased type.
     fn alias_target(&self, p: PathId) -> Option<(ItemId, TyId)> {
         let path = self.hir.path(p);
         if path.unresolved != 0 || path.qself.is_some() {
@@ -244,7 +366,7 @@ impl Ctx<'_> {
         }
         let item = self.local_item(path.res)?;
         match self.item_kind(item) {
-            ItemKind::Alias { ty, .. } if !self.idx.is_generic(item) => Some((item, ty)),
+            ItemKind::Alias { ty, .. } => Some((item, ty)),
             _ => None,
         }
     }
@@ -260,66 +382,159 @@ impl Ctx<'_> {
         }
     }
 
-    fn has_generic_args(&self, p: PathId) -> bool {
-        let path = self.hir.path(p);
-        self.hir
-            .list(path.segments)
-            .iter()
-            .any(|s| !s.args.is_empty())
+    /// The positional generic arguments written on the last segment of
+    /// `p`, lowered (they are children of the path, so already memoized).
+    fn segment_args(&mut self, p: PathId, sig: bool) -> Result<Vec<TypeId>, CheckError> {
+        let path = *self.hir.path(p);
+        let Some(last) = self.hir.list(path.segments).last().copied() else {
+            return Ok(Vec::new());
+        };
+        let written = self.written_args(last.args);
+        let mut out = Vec::with_capacity(written.len());
+        for a in written {
+            out.push(self.lower_arg(a, sig)?);
+        }
+        Ok(out)
     }
 
     /// The type a path in a type annotation names.
-    fn path_ty(&mut self, ty: TyId, p: PathId) -> Result<TypeId, CheckError> {
+    fn path_ty(
+        &mut self,
+        ty: TyId,
+        p: PathId,
+        self_ty: Option<TypeId>,
+        sig: bool,
+    ) -> Result<TypeId, CheckError> {
         let at = NodeRef::Ty(ty);
         let path = *self.hir.path(p);
-        let unsupported = |feature| DiagnosticKind::Unsupported { feature };
-        if path.qself.is_some() {
-            self.report(at, unsupported(Feature::Traits));
+        let segments = self.hir.list(path.segments);
+        let last = segments.last().copied();
+        // `<T as Iface>::Name` and `<T>::Name`.
+        if let Some(q) = path.qself {
+            let Some(last) = last else {
+                return Ok(TypeId::ERROR);
+            };
+            let qt = self.sub(q.ty);
+            if q.trait_len == 0 {
+                return self.assoc_type_of(qt, last.name.sym, at);
+            }
+            let Some(iface) = self
+                .local_item(path.res)
+                .filter(|&i| matches!(self.item_kind(i), ItemKind::Interface(_)))
+            else {
+                if path.res != Res::Err {
+                    self.report(at, DiagnosticKind::NotAnInterface);
+                }
+                return Ok(TypeId::ERROR);
+            };
+            let trait_seg = segments
+                .get(q.trait_len.saturating_sub(1) as usize)
+                .copied();
+            let written = trait_seg.map_or_else(Vec::new, |s| self.written_args(s.args));
+            let args = self.fill_args(iface, &written, at, sig, Some(qt))?;
+            return match self.assoc_named(iface, last.name.sym)? {
+                Some((decl, assoc)) => {
+                    let mut pargs = alloc::vec![qt];
+                    pargs.extend(args);
+                    self.name_item(assoc);
+                    let proj = self.types.projection(decl, assoc, &pargs);
+                    self.normalize(proj, at)
+                }
+                None => {
+                    self.report(
+                        at,
+                        DiagnosticKind::NoAssocType {
+                            name: last.name.sym,
+                        },
+                    );
+                    Ok(TypeId::ERROR)
+                }
+            };
+        }
+        if path.unresolved > 1 {
+            if path.res != Res::Err {
+                self.report(
+                    at,
+                    DiagnosticKind::Unsupported {
+                        feature: Feature::LongAssocPaths,
+                    },
+                );
+            }
             return Ok(TypeId::ERROR);
         }
-        if path.unresolved != 0 {
+        if path.unresolved == 1 {
+            // `T::Item`, `Self::Item`: an associated type by type.
             if path.res == Res::Err {
                 return Ok(TypeId::ERROR);
             }
-            // `Self::Item`, `T::Item`, `a::B::C` by type: associated types.
-            self.report(at, unsupported(Feature::AssociatedTypes));
-            return Ok(TypeId::ERROR);
+            let Some(last) = last else {
+                return Ok(TypeId::ERROR);
+            };
+            let prefix = if segments.len() == 1 {
+                match path.root {
+                    PathRoot::SelfType | PathRoot::StaticType => {
+                        self_ty.or_else(|| self.ctx_self())
+                    }
+                    _ => None,
+                }
+            } else {
+                self.prefix_res_type(path.res, at)?
+            };
+            return match prefix {
+                Some(t) => self.assoc_type_of(t, last.name.sym, at),
+                None => {
+                    self.report(at, DiagnosticKind::NotAType);
+                    Ok(TypeId::ERROR)
+                }
+            };
         }
-        if self.has_generic_args(p) {
-            self.report(at, unsupported(Feature::Generics));
-            return Ok(TypeId::ERROR);
-        }
+        let written = match last {
+            Some(seg) => self.written_args(seg.args),
+            None => Vec::new(),
+        };
         Ok(match path.res {
             Res::Def(d) if d.unit() == self.hir.unit() => match d.def() {
                 Def::Item(i) => match self.item_kind(i) {
                     ItemKind::Record(_) | ItemKind::Sum(_) | ItemKind::Class(_) => {
-                        if self.idx.is_generic(i) {
-                            // Reported once, at the generic item.
-                            TypeId::ERROR
-                        } else {
-                            self.name_item(i);
-                            self.types.adt(i)
-                        }
+                        self.name_item(i);
+                        let args = self.fill_args(i, &written, at, sig, None)?;
+                        // A written instance must satisfy the item's bounds
+                        // (checked in the scope of the annotation).
+                        self.push_bounds(i, &args, at)?;
+                        self.types.adt_with(i, &args)
                     }
-                    ItemKind::Alias { ty, .. } => {
+                    ItemKind::Alias { ty: body, .. } => {
                         if let Some(s) = self.alias_state.get_mut(i.index()) {
                             if *s == 1 {
                                 *s = 2;
                             }
                         }
-                        if self.idx.is_generic(i) {
-                            TypeId::ERROR
-                        } else {
-                            self.sub(ty)
-                        }
+                        let body_ty = self.sub(body);
+                        let args = self.fill_args(i, &written, at, sig, None)?;
+                        let params = self.own_params(i);
+                        self.subst(body_ty, &params, &args)?
                     }
                     ItemKind::Interface(_) => {
-                        self.report(at, unsupported(Feature::Traits));
-                        TypeId::ERROR
+                        if self.profile.polymorphism == Polymorphism::Interfaces {
+                            self.dyn_type(&[ty], at)?
+                        } else {
+                            self.report(at, DiagnosticKind::InterfaceAsType);
+                            TypeId::ERROR
+                        }
                     }
                     ItemKind::AssocType { .. } => {
-                        self.report(at, unsupported(Feature::AssociatedTypes));
-                        TypeId::ERROR
+                        // A bare associated-type name inside its interface.
+                        match self.idx.owner_of(i) {
+                            Some(iface) => {
+                                let s = self.types.self_of(iface);
+                                let mut pargs = alloc::vec![s];
+                                pargs.extend(self.own_params(iface));
+                                self.name_item(i);
+                                let proj = self.types.projection(iface, i, &pargs);
+                                self.normalize(proj, at)?
+                            }
+                            None => TypeId::ERROR,
+                        }
                     }
                     ItemKind::Err => TypeId::ERROR,
                     _ => {
@@ -328,19 +543,35 @@ impl Ctx<'_> {
                     }
                 },
                 Def::Variant(v) => match self.hir.variant_owner(v) {
-                    Some(sum) if !self.idx.is_generic(sum) => {
+                    Some(sum) => {
                         self.name_item(sum);
-                        self.types.adt(sum)
+                        let args = self.fill_args(sum, &written, at, sig, None)?;
+                        self.types.adt_with(sum, &args)
                     }
-                    _ => TypeId::ERROR,
+                    None => TypeId::ERROR,
                 },
             },
-            Res::Def(d) => self.types.foreign(d),
+            Res::Def(d) => {
+                let args = self.segment_args(p, sig)?;
+                self.types.foreign_with(d, &args)
+            }
             Res::Prim(p) => TypeId::prim(p),
-            Res::Extern(sym) => self.types.external(sym),
+            Res::Extern(sym) => {
+                let args = self.segment_args(p, sig)?;
+                self.types.external_with(sym, &args)
+            }
             Res::Local(b) => match self.hir.binder(b) {
                 Some(binder) if binder.kind == hir_lang::BinderKind::TypeParam => {
                     self.types.name_binder(b, binder.name.sym);
+                    if !written.is_empty() {
+                        self.report(
+                            at,
+                            DiagnosticKind::GenericArity {
+                                expected: 0,
+                                found: u32::try_from(written.len()).unwrap_or(u32::MAX),
+                            },
+                        );
+                    }
                     self.types.param(b)
                 }
                 _ => {
@@ -353,6 +584,42 @@ impl Ctx<'_> {
                 TypeId::ERROR
             }
             Res::Err => TypeId::ERROR,
+        })
+    }
+
+    /// The type a resolved path prefix names (`T` of `T::Item`, `Vec` of
+    /// `Vec::Item`).
+    fn prefix_res_type(&mut self, res: Res, at: NodeRef) -> Result<Option<TypeId>, CheckError> {
+        Ok(match res {
+            Res::Local(b) => match self.hir.binder(b) {
+                Some(x) if x.kind == hir_lang::BinderKind::TypeParam => {
+                    self.types.name_binder(b, x.name.sym);
+                    Some(self.types.param(b))
+                }
+                _ => None,
+            },
+            Res::Def(d) if d.unit() == self.hir.unit() => match d.def() {
+                Def::Item(i) => match self.item_kind(i) {
+                    ItemKind::Record(_) | ItemKind::Sum(_) | ItemKind::Class(_) => {
+                        Some(self.adt_fresh(i))
+                    }
+                    ItemKind::Alias { ty, .. } => {
+                        let saved = self.lower_ctx.replace(i);
+                        let t = self.lower_ty(ty, None, true);
+                        self.lower_ctx = saved;
+                        Some(t?)
+                    }
+                    _ => {
+                        self.report(at, DiagnosticKind::NotAType);
+                        None
+                    }
+                },
+                Def::Variant(_) => None,
+            },
+            Res::Def(d) => Some(self.types.foreign(d)),
+            Res::Prim(p) => Some(TypeId::prim(p)),
+            Res::Extern(s) => Some(self.types.external(s)),
+            _ => None,
         })
     }
 
@@ -459,6 +726,17 @@ impl Ctx<'_> {
         let ItemKind::Fn(def) = self.item_kind(item) else {
             return Ok(None);
         };
+        let saved = self.lower_ctx.replace(item);
+        let r = self.sig_inner(item, def);
+        self.lower_ctx = saved;
+        r
+    }
+
+    fn sig_inner(
+        &mut self,
+        item: ItemId,
+        def: hir_lang::FnDef,
+    ) -> Result<Option<usize>, CheckError> {
         let self_ty = self.item_self(item);
         // Under `Dynamic`, annotations are run-time hints: nothing is
         // lowered, and every parameter is `any`.
@@ -572,14 +850,23 @@ impl Ctx<'_> {
             .copied()
             .filter(|&o| o != NONE)
             .and_then(|o| ItemId::from_index(o as usize));
-        let self_ty = owner.map(|o| self.types.adt(o));
+        let self_ty = owner.map(|o| {
+            if self.profile.is_static() {
+                self.adt_identity(o)
+            } else {
+                self.types.adt(o)
+            }
+        });
+        let saved = core::mem::replace(&mut self.lower_ctx, owner);
         let t = match self.hir.field(f).ty {
-            Some(ty) => self.lower_ty(ty, self_ty, true)?,
+            Some(ty) => self.lower_ty(ty, self_ty, true),
             None => {
                 self.report(NodeRef::Field(f), DiagnosticKind::MissingAnnotation);
-                TypeId::ERROR
+                Ok(TypeId::ERROR)
             }
         };
+        self.lower_ctx = saved;
+        let t = t?;
         if let Some(slot) = self.field_memo.get_mut(f.index()) {
             *slot = t.raw();
         }
@@ -598,34 +885,42 @@ impl Ctx<'_> {
             _ => return Ok(TypeId::ERROR),
         };
         let self_ty = self.item_self(item);
+        let saved = self.lower_ctx.replace(item);
         let t = match ty {
-            Some(ty) => self.lower_ty(ty, self_ty, true)?,
+            Some(ty) => self.lower_ty(ty, self_ty, true),
             None => {
                 self.report(NodeRef::Item(item), DiagnosticKind::MissingAnnotation);
-                TypeId::ERROR
+                Ok(TypeId::ERROR)
             }
         };
+        self.lower_ctx = saved;
+        let t = t?;
         if let Some(slot) = self.decl_memo.get_mut(item.index()) {
             *slot = t.raw();
         }
         Ok(t)
     }
 
-    /// The nominal type of a record, sum, or class item (`{error}` when the
-    /// item is generic, which is reported at the item).
+    /// The nominal type of a record, sum, or class item at a use: fresh
+    /// arguments for a generic item.
     pub(crate) fn adt_type(&mut self, item: ItemId) -> TypeId {
-        if self.idx.is_generic(item) {
-            return TypeId::ERROR;
+        if !self.profile.is_static() {
+            self.name_item(item);
+            return self.types.adt(item);
         }
-        self.name_item(item);
-        self.types.adt(item)
+        self.adt_fresh(item)
     }
 }
 
-/// The type children of a type node, in order.
+/// The type children of a type node lowered before it, in order: elements,
+/// members, parameters, and a path's qualified self and generic type
+/// arguments. (Interface paths in `dyn` and `impl` bounds are not types;
+/// they are lowered as bounds.)
 fn ty_children(node: &Ty, hir: &hir_lang::Hir, out: &mut Vec<TyId>) {
     match *node {
-        Ty::Tuple(list) => out.extend_from_slice(hir.list(list)),
+        Ty::Tuple(list) | Ty::Union(list) | Ty::Intersection(list) => {
+            out.extend_from_slice(hir.list(list));
+        }
         Ty::Array { elem, .. } => out.push(elem),
         Ty::Slice(t) | Ty::Ref { inner: t, .. } | Ty::Ptr { inner: t, .. } | Ty::Nullable(t) => {
             out.push(t);
@@ -633,6 +928,19 @@ fn ty_children(node: &Ty, hir: &hir_lang::Hir, out: &mut Vec<TyId>) {
         Ty::Fn { params, ret, .. } => {
             out.extend_from_slice(hir.list(params));
             out.push(ret);
+        }
+        Ty::Path(p) => {
+            let path = hir.path(p);
+            if let Some(q) = path.qself {
+                out.push(q.ty);
+            }
+            for seg in hir.list(path.segments) {
+                for a in hir.list(seg.args) {
+                    if let GenericArg::Ty(t) | GenericArg::Binding { ty: t, .. } = *a {
+                        out.push(t);
+                    }
+                }
+            }
         }
         _ => {}
     }

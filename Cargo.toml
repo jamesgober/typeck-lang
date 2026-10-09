@@ -3,7 +3,7 @@
 # =============================================================================
 [package]
 name    = "typeck-lang"
-version = "0.2.0"
+version = "0.3.0"
 
 # Minimum Supported Rust Version (MSRV)
 rust-version = "1.85"
@@ -16,7 +16,7 @@ license = "Apache-2.0 OR MIT"
 readme = "README.md"
 
 # Description
-description = "Profile-driven type checking over HIR: dynamic, gradual, static, and Hindley-Milner from one checker."
+description = "Profile-driven type checking over HIR: dynamic, gradual, static (generics, traits, inference), and Hindley-Milner from one checker."
 
 # Keywords (5 max)
 keywords = ["typechecker", "inference", "types", "compiler", "lexersketch"]
@@ -46,17 +46,20 @@ path = "src/lib.rs"
 [features]
 default = ["std"]
 # The standard library. Without it the crate is `no_std` and needs only `alloc`.
-std = ["hir-lang/std", "intern-lang/std"]
+std = ["hir-lang/std", "intern-lang/std", "match-lang/std"]
 
 
 # DEPENDENCIES
 # #################################
 [dependencies]
-# The input: the checker walks HIR (spec v2) and keys its side tables by HIR ids.
-hir-lang = { version = "0.3", default-features = false }
+# The input: the checker walks HIR (spec v3) and keys its side tables by HIR ids.
+hir-lang = { version = "0.4", default-features = false }
 # Names: `Lookup` renders symbols in type displays and diagnostic messages. The
 # same interner version hir-lang uses, so `Symbol`s pass between them unchanged.
 intern-lang = { version = "1", default-features = false }
+# Exhaustiveness and usefulness: the checker implements match-lang's `Model`
+# over its own types and reports missing witnesses and unreachable arms.
+match-lang = { version = "0.2", default-features = false }
 # type-lang is deliberately not wired: its unifier expands shared structure
 # exponentially (ISSUES M39-M41). See dev/ROADMAP.md, "Dependency wiring".
 

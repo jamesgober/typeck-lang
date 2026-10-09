@@ -36,24 +36,40 @@
 //! - **Profiles as data** ([`Profile`], [`Discipline`]): `dynamic`,
 //!   `gradual`, `static-explicit`, `static-inferred`, and `hm`, with toggles
 //!   for subtyping, nominal or structural records, numeric widening, null
-//!   safety, exhaustive matches, and traits versus interfaces. This version
-//!   implements `dynamic` and `static-explicit`; the others return
-//!   [`CheckError::NotImplemented`] (see `dev/ROADMAP.md`).
+//!   safety, exhaustive matches, traits versus interfaces, implicit receiver
+//!   borrowing, the monomorphization policy, `let x = null`, and `?`. This
+//!   version implements `dynamic`, `static-explicit`, and `static-inferred`;
+//!   `gradual` and `hm` return [`CheckError::NotImplemented`] (see
+//!   `dev/ROADMAP.md`).
+//! - **Generics and interfaces**: generic functions and types with bounds and
+//!   where clauses, constant parameters, defaults; interfaces (traits) with
+//!   methods, default methods, constants, associated types, and supertraits;
+//!   `impl` blocks, generic ones indexed like any other; interface method
+//!   resolution through bounds, `dyn` types, and implementations; `impl
+//!   Trait` parameters and results; coherence (overlapping implementations)
+//!   and conformance (missing, extra, or mistyped members).
+//! - **Bidirectional checking**: expected types flow into arguments of
+//!   generic calls, record literals, and closures (whose signatures
+//!   `static-inferred` infers).
+//! - **Exhaustiveness** through match-lang: missing values as witnesses,
+//!   unreachable arms and redundant alternatives as warnings.
 //! - **Output** ([`Typed`]): dense side tables of types keyed by HIR
 //!   expression, pattern, and binder ids; typed diagnostics with origins;
 //!   the implicit conversions lowering must materialise; how each operation
-//!   resolved (integer, IEEE, string); and the definitions of partial paths'
-//!   unresolved tails (`Shape::Circle`, `Point::new`).
+//!   resolved (integer, IEEE, string); the definitions of partial paths'
+//!   unresolved tails (`Shape::Circle`, `T::new`); what each use of a generic
+//!   item instantiates; and the monomorphization plan ([`MonoPlan`]).
 //! - **One root cause, one diagnostic**: anything reported has type
 //!   [`TypeId::ERROR`], which every later check accepts silently.
 //! - **Termination**: union-find over hash-consed type terms (no exponential
 //!   blow-up on shared structure), iterative traversals everywhere, and a
-//!   [`Budget`] that turns pathological input into
-//!   [`CheckError::BudgetExceeded`] instead of a hang.
+//!   [`Budget`] (steps, type-store size, trait-resolution depth) that turns
+//!   pathological input into [`CheckError::BudgetExceeded`] instead of a
+//!   hang.
 //!
 //! The checker does not resolve names (resolve-lang does) and does not
-//! compile patterns (match-lang does): it checks the top-level coverage of a
-//! `match` and lists the rest in [`Typed::deferred_matches`].
+//! compile patterns into decision trees (match-lang decides exhaustiveness
+//! for it; lowering compiles them).
 
 #![cfg_attr(not(feature = "std"), no_std)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
@@ -77,14 +93,16 @@ mod check;
 mod diag;
 mod error;
 mod infer;
+mod mono;
 mod profile;
 mod typed;
 mod types;
 
 pub use check::Checker;
-pub use diag::{Diagnostic, DiagnosticKind, Feature};
+pub use diag::{Diagnostic, DiagnosticKind, Feature, Severity};
 pub use error::{Budget, CheckError, Limit};
-pub use profile::{Discipline, Polymorphism, Profile, RecordTyping};
+pub use mono::{Dispatch, Instance, Instantiation, MonoPlan, MonoPolicy, Strategy};
+pub use profile::{Discipline, NullLet, Polymorphism, Profile, RecordTyping, TryHook};
 pub use typed::{Coercion, OpClass, Stats, Typed};
 pub use types::{Field, Type, TypeDisplay, TypeId, Types};
 

@@ -172,11 +172,7 @@ fn test_unimplemented_disciplines_and_invalid_profiles() {
     let mut k = Kit::new();
     let body = k.block(&[], None);
     let (hir, _) = k.finish_main(&[], body);
-    for p in [
-        Profile::gradual(),
-        Profile::static_inferred(),
-        Profile::hm(),
-    ] {
+    for p in [Profile::gradual(), Profile::hm()] {
         assert_eq!(
             check(&hir, &p),
             Err(CheckError::NotImplemented {
@@ -187,6 +183,7 @@ fn test_unimplemented_disciplines_and_invalid_profiles() {
     let bad = Profile::static_explicit().with_literal_defaults(Prim::F64, Prim::F64);
     assert_eq!(check(&hir, &bad), Err(CheckError::InvalidProfile));
     assert!(Discipline::Dynamic.is_implemented());
+    assert!(check(&hir, &Profile::static_inferred()).is_ok_and(|t| t.is_ok()));
     assert_eq!(
         CheckError::NotImplemented {
             discipline: Discipline::Hm
@@ -211,6 +208,6 @@ fn test_partial_paths_resolve_under_dynamic_too() {
     let typed = check(&hir, &Profile::static_explicit()).unwrap();
     assert_eq!(typed.path_def(ap), Some(hir_lang::Def::Variant(circle)));
     assert!(
-        matches!(typed.types().get(typed.expr(e).unwrap()), typeck_lang::Type::Adt(i) if i == shape)
+        matches!(typed.types().get(typed.expr(e).unwrap()), typeck_lang::Type::Adt { item: i, .. } if i == shape)
     );
 }

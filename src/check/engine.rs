@@ -15,8 +15,8 @@
 use alloc::vec::Vec;
 
 use hir_lang::{
-    Arm, AsmDir, AsmOptions, BinderId, Block, Closure, Expr, ExprId, Intrinsic, ItemKind, Lit,
-    MapEntry, NodeRef, ParamKind, Prim, Stmt, StmtId,
+    Arm, AsmDir, AsmOptions, BinderId, Block, Closure, Expr, ExprId, Intrinsic, ItemKind, MapEntry,
+    NodeRef, ParamKind, Prim, Stmt, StmtId,
 };
 
 use super::{
@@ -46,6 +46,8 @@ pub(crate) enum Task {
     AssignPrep(ExprId),
     /// Arm `i` of a `match` (or catch `i` of a `try`) after the scrutinee.
     ArmPat(ExprId, u32),
+    /// A `let_place` after its place: bind the alias.
+    PlaceBind(ExprId),
 }
 
 impl Ctx<'_> {
@@ -72,6 +74,7 @@ impl Ctx<'_> {
                 Task::MethodPrep(e) => self.method_prep(e)?,
                 Task::AssignPrep(e) => self.assign_prep(e)?,
                 Task::ArmPat(e, i) => self.arm_pat(e, i)?,
+                Task::PlaceBind(e) => self.place_bind(e),
             }
             crate::infer::Infer::check_size(&self.types, &self.meter)?;
         }
@@ -112,9 +115,9 @@ impl Ctx<'_> {
             }
             Expr::Path(p) => {
                 let r = self.value_path(p, NodeRef::Expr(e))?;
-                if let ValueRef::Fn(item) = r {
-                    if let Some(slot) = self.callee_fns.get_mut(e.index()) {
-                        *slot = u32::try_from(item.index()).unwrap_or(NONE);
+                if let ValueRef::Fn { sig, .. } = r {
+                    if let Some(slot) = self.callee_sigs.get_mut(e.index()) {
+                        *slot = sig;
                     }
                 }
                 let t = self.value_type(r)?;
@@ -160,17 +163,27 @@ impl Ctx<'_> {
             Expr::Record { path, fields, base } => {
                 if let Some(p) = path {
                     if let Some(target) = self.record_ref(p, NodeRef::Expr(e))? {
-                        self.record_targets.push((e, target));
+                        let adt = self.record_ref_type(target, Some(p));
+                        // Checking mode: an expected instance fixes the
+                        // arguments before the fields are checked.
+                        if let Some(exp) = self.peek_expect(e) {
+                            let snap = self.infer.snapshot();
+                            if self.unify(adt, exp)? {
+                                self.infer.commit();
+                            } else {
+                                self.infer.rollback(snap);
+                            }
+                        }
+                        self.record_targets.push((e, target, adt));
                         let owner = field_owner(target);
                         for fi in hir.list(fields) {
                             if let Some((_, f)) = self.idx.field_named(owner, fi.name.sym) {
-                                let ft = self.field_type(f)?;
+                                let ft = self.field_type_in(f, adt)?;
                                 self.set_expect(fi.value, ft);
                             }
                         }
                         if let Some(b) = base {
-                            let t = self.record_ref_type(target);
-                            self.set_expect(b, t);
+                            self.set_expect(b, adt);
                         }
                     }
                 }
@@ -304,12 +317,26 @@ impl Ctx<'_> {
                 tasks.push(Task::Exit(e));
                 tasks.extend(value.map(Task::Expr));
             }
-            Expr::Yield(value) => {
+            Expr::Yield { key, value } => {
                 if let (Some(v), Some(y)) = (value, self.frames.last().and_then(|f| f.yields)) {
                     self.set_expect(v, y);
                 }
                 tasks.push(Task::Exit(e));
                 tasks.extend(value.map(Task::Expr));
+                tasks.extend(key.map(Task::Expr));
+            }
+            Expr::YieldFrom(inner) => {
+                tasks.push(Task::Exit(e));
+                tasks.push(Task::Expr(inner));
+            }
+            Expr::LetPlace { place, body, .. } => {
+                if let Some(exp) = self.delegate(e) {
+                    self.set_expect(body, exp);
+                }
+                tasks.push(Task::Exit(e));
+                tasks.push(Task::Expr(body));
+                tasks.push(Task::PlaceBind(e));
+                tasks.push(Task::Expr(place));
             }
             Expr::Closure(c) => self.enter_closure(e, c, tasks)?,
             Expr::Asm(asm) => {
@@ -432,16 +459,51 @@ impl Ctx<'_> {
                 *slot = t.raw();
             }
         }
+        // Checking mode: an expected function type gives unannotated
+        // parameters (and the result) their types.
+        let infer = self.profile.infers_closures();
+        let expected: Option<(Vec<TypeId>, TypeId)> = if infer {
+            self.peek_expect(e)
+                .and_then(|x| match self.types.get(self.resolve(x)) {
+                    Type::Fn { params, ret, .. } => Some((params.to_vec(), ret)),
+                    _ => None,
+                })
+        } else {
+            None
+        };
+        let positional = hir
+            .list(c.params)
+            .iter()
+            .filter(|&&p| {
+                matches!(
+                    hir.param(p).kind,
+                    ParamKind::Receiver | ParamKind::PositionalOnly | ParamKind::Normal
+                )
+            })
+            .count();
+        let expected = expected.filter(|(ps, _)| ps.len() == positional);
         let mut params = Vec::new();
+        let mut pos = 0usize;
         for &pid in hir.list(c.params) {
             let param = *hir.param(pid);
+            let is_pos = matches!(
+                param.kind,
+                ParamKind::Receiver | ParamKind::PositionalOnly | ParamKind::Normal
+            );
             let t = match param.ty {
                 Some(t) => self.lower_ty(t, self.cur_self, false)?,
+                None if infer => match (&expected, is_pos) {
+                    (Some((ps, _)), true) => ps.get(pos).copied().unwrap_or(TypeId::ERROR),
+                    _ => self.fresh(GENERAL),
+                },
                 None => {
                     self.report(NodeRef::Param(pid), DiagnosticKind::MissingAnnotation);
                     TypeId::ERROR
                 }
             };
+            if is_pos {
+                pos += 1;
+            }
             self.bind_param(param.pat, param.kind, t)?;
             if matches!(
                 param.kind,
@@ -453,9 +515,10 @@ impl Ctx<'_> {
                 self.set_expect(d, t);
             }
         }
-        let ret = match c.ret {
-            Some(t) => self.lower_ty(t, self.cur_self, false)?,
-            None => self.fresh(GENERAL),
+        let ret = match (c.ret, &expected) {
+            (Some(t), _) => self.lower_ty(t, self.cur_self, false)?,
+            (None, Some((_, r))) => *r,
+            (None, None) => self.fresh(GENERAL),
         };
         let fn_ty = self.types.func(&params, ret, c.effects);
         if let Some(b) = c.self_binder {
@@ -496,6 +559,7 @@ impl Ctx<'_> {
     ) -> Frame {
         let generator = effects.contains(hir_lang::Effects::YIELD);
         Frame {
+            declared: ret,
             ret: if generator { TypeId::UNIT } else { ret },
             throws,
             yields: generator.then_some(ret),
@@ -587,7 +651,26 @@ impl Ctx<'_> {
         };
         let t = match (annotation, init) {
             (Some(t), _) => t,
-            (None, Some(i)) => self.child(i),
+            (None, Some(i)) => {
+                let t = self.child(i);
+                // `let x = null`: the profile decides (ISSUES P17).
+                if self.tag(t) == Tag::Null
+                    && self.profile.null_let == crate::profile::NullLet::Nullable
+                {
+                    let v = self.fresh(GENERAL);
+                    let n = if self.profile.null_safety {
+                        self.types.nullable(v)
+                    } else {
+                        v
+                    };
+                    if self.profile.null_safety {
+                        self.coercions.push((i, crate::typed::Coercion::Null, n));
+                    }
+                    n
+                } else {
+                    t
+                }
+            }
             (None, None) => self.fresh(GENERAL),
         };
         match *self.hir.stmt(s) {
@@ -636,6 +719,16 @@ impl Ctx<'_> {
             self.set_expect(value, t);
         }
         Ok(())
+    }
+
+    /// A `let_place` alias has the place's type.
+    fn place_bind(&mut self, e: ExprId) {
+        if let Expr::LetPlace { binder, place, .. } = *self.hir.expr(e) {
+            let t = self.child(place);
+            if let Some(slot) = self.binder_ty.get_mut(binder.index()) {
+                *slot = t.raw();
+            }
+        }
     }
 
     fn arm_pat(&mut self, e: ExprId, i: u32) -> Result<(), CheckError> {
@@ -744,10 +837,13 @@ impl Ctx<'_> {
                         );
                     }
                 }
-                TypeId::UNIT
+                // HIR v3: an assignment evaluates to the value stored (a
+                // language whose assignment yields unit lowers a use of its
+                // value as `{ a = b; () }`).
+                self.child(target)
             }
             Expr::Deref(inner) => {
-                let t = self.resolve(self.child(inner));
+                let t = self.known(self.child(inner))?;
                 match self.types.get(t) {
                     Type::Ref { inner, .. } | Type::Ptr { inner, .. } => inner,
                     Type::Error => TypeId::ERROR,
@@ -814,13 +910,41 @@ impl Ctx<'_> {
                 TypeId::NEVER
             }
             Expr::Return(_) | Expr::Throw(_) | Expr::Continue { .. } => TypeId::NEVER,
-            Expr::Yield(_) => TypeId::UNIT,
+            // Under the generator convention (HIR.md, typeck notes) the
+            // values sent back into a generator are not typed: `yield`
+            // evaluates to unit, and `yield from` (whose value is the inner
+            // generator's return value, which the convention does not
+            // track) too.
+            Expr::Yield { .. } => TypeId::UNIT,
+            Expr::YieldFrom(inner) => {
+                let t = self.known(self.child(inner))?;
+                let want = self.frames.last().and_then(|f| f.yields);
+                match (self.types.get(t), want) {
+                    (Type::Generator { item, .. }, Some(y)) => {
+                        let _ = self.coerce_expr(inner, item, y)?;
+                    }
+                    (Type::Error, _) | (_, None) => {}
+                    (Type::Any, _) => self.report(at, DiagnosticKind::DynamicOperation),
+                    (_, Some(y)) => {
+                        let expected = self.types.generator(y, false);
+                        self.report(
+                            NodeRef::Expr(inner),
+                            DiagnosticKind::Mismatch { expected, found: t },
+                        );
+                    }
+                }
+                TypeId::UNIT
+            }
+            Expr::LetPlace { body, .. } => match self.was_delegated(e) {
+                Some(exp) => self.branches_type(exp, &[body]),
+                None => self.child(body),
+            },
             Expr::Closure(_) => {
                 let _ = self.frames.pop();
                 self.closure_types.pop().unwrap_or(TypeId::ERROR)
             }
             Expr::Await(inner) => {
-                let t = self.resolve(self.child(inner));
+                let t = self.known(self.child(inner))?;
                 match self.types.get(t) {
                     Type::Async(r) | Type::Task(r) => r,
                     Type::Error => TypeId::ERROR,
@@ -833,7 +957,7 @@ impl Ctx<'_> {
             Expr::Spawn(callable) => {
                 // The task runs the callable; awaiting the handle yields
                 // its result.
-                let t = self.resolve(self.child(callable));
+                let t = self.known(self.child(callable))?;
                 match self.types.get(t) {
                     Type::Fn {
                         params: [], ret, ..
@@ -934,15 +1058,14 @@ impl Ctx<'_> {
             fs.sort_by_key(|f| f.name);
             return Ok(self.types.record_sorted(&fs));
         }
-        let target = match self.record_targets.last() {
-            Some(&(q, t)) if q == e => {
+        let (target, adt) = match self.record_targets.last() {
+            Some(&(q, t, adt)) if q == e => {
                 let _ = self.record_targets.pop();
-                t
+                (t, adt)
             }
             // The path was reported (or is `{error}`).
             _ => return Ok(TypeId::ERROR),
         };
-        let adt = self.record_ref_type(target);
         let owner = field_owner(target);
         let mut unknown = false;
         for fi in inits {
@@ -1078,7 +1201,8 @@ impl Ctx<'_> {
         member: hir_lang::Member,
     ) -> Result<TypeId, CheckError> {
         let at = NodeRef::Expr(e);
-        let t = self.settle_literal(self.child(base))?;
+        let t = self.known(self.child(base))?;
+        let t = self.settle_literal(t)?;
         match self.tag(t) {
             // An unknown base: `CannotInfer` reports the cause.
             Tag::Error | Tag::Never | Tag::Var => return Ok(TypeId::ERROR),
@@ -1106,7 +1230,7 @@ impl Ctx<'_> {
 
     fn index_exit(&mut self, e: ExprId, base: ExprId, index: ExprId) -> Result<TypeId, CheckError> {
         let at = NodeRef::Expr(e);
-        let mut t = self.resolve(self.child(base));
+        let mut t = self.known(self.child(base))?;
         while let Type::Ref { inner, .. } = self.types.get(t) {
             self.meter.tick(1)?;
             t = self.resolve(inner);
@@ -1231,9 +1355,10 @@ impl Ctx<'_> {
         scrutinee: ExprId,
         arms: &[Arm],
     ) -> Result<TypeId, CheckError> {
-        if self.profile.exhaustive_match {
-            self.exhaustiveness(e, scrutinee, arms)?;
-        }
+        let _ = scrutinee;
+        // Exhaustiveness and usefulness are decided by match-lang once every
+        // type is known (see `exhaust`).
+        self.matches.push(e);
         if let Some(exp) = self.was_delegated(e) {
             let bodies: Vec<ExprId> = arms.iter().map(|a| a.body).collect();
             return Ok(self.branches_type(exp, &bodies));
@@ -1341,6 +1466,12 @@ impl Ctx<'_> {
                 self.types.tuple(&[t, TypeId::prim(Prim::Bool)])
             }
             Intrinsic::Fence(_) => TypeId::UNIT,
+            Intrinsic::Named(name) if self.is_try(name) && args.len() == 1 => {
+                let Some(&arg) = args.first() else {
+                    return Ok(TypeId::ERROR);
+                };
+                self.try_exit(e, arg)?
+            }
             Intrinsic::Named(name) => match self.host_intrinsic(name) {
                 Some(f) => match self.types.get(self.resolve(f)) {
                     Type::Fn { params, ret, .. } => {
@@ -1381,114 +1512,161 @@ impl Ctx<'_> {
         })
     }
 
-    /// The certain part of exhaustiveness: a sum variant (or `bool` value)
-    /// that no unguarded arm can match is reported; when coverage depends
-    /// on nested patterns the match is deferred to a pattern compiler.
-    fn exhaustiveness(
-        &mut self,
-        e: ExprId,
-        scrutinee: ExprId,
-        arms: &[Arm],
-    ) -> Result<(), CheckError> {
-        let t = self.resolve(self.child(scrutinee));
-        let hir = self.hir;
-        let mut catch_all = false;
-        let mut nested = false;
-        for arm in arms {
-            if arm.guard.is_none() && self.irrefutable(arm.pat)? {
-                catch_all = true;
-            }
-        }
-        if catch_all || matches!(self.tag(t), Tag::Error | Tag::Never | Tag::Any | Tag::Var) {
-            return Ok(());
+    /// Whether `name` is the profile's `?` intrinsic.
+    fn is_try(&self, name: hir_lang::Symbol) -> bool {
+        matches!(self.profile.try_hook, crate::profile::TryHook::Intrinsic { name: n, .. } if n == name)
+    }
+
+    /// `?` through the profile's hook: the operand's success value, with
+    /// the failure propagated out of the enclosing function.
+    fn try_exit(&mut self, e: ExprId, arg: ExprId) -> Result<TypeId, CheckError> {
+        let t = self.known(self.child(arg))?;
+        let t = self.settle_literal(t)?;
+        let declared = self.frames.last().map_or(TypeId::ERROR, |f| f.declared);
+        let declared = self.resolve(declared);
+        if matches!(self.tag(t), Tag::Error | Tag::Never) || self.is_err(declared) {
+            return Ok(TypeId::ERROR);
         }
         match self.types.get(t) {
-            Type::Adt(item) => {
-                let ItemKind::Sum(def) = self.item_kind(item) else {
-                    // A record or class: one constructor; nested fields decide.
-                    if !arms.is_empty() {
-                        self.deferred.push(e);
-                    } else {
-                        self.report(
-                            NodeRef::Expr(e),
-                            DiagnosticKind::NonExhaustive { missing: None },
-                        );
+            Type::Nullable(inner) => {
+                let ok = match self.types.get(declared) {
+                    Type::Nullable(_) => true,
+                    _ if self.tag(declared) == Tag::Var => {
+                        let v = self.fresh(GENERAL);
+                        let n = self.types.nullable(v);
+                        self.unify(declared, n)?
                     }
-                    return Ok(());
+                    _ => false,
                 };
-                for &v in hir.list(def.variants) {
-                    self.meter.tick(1)?;
-                    let mut covered = false;
-                    let mut maybe = false;
-                    for arm in arms {
-                        if arm.guard.is_some() {
-                            continue;
-                        }
-                        match self.covers_variant(arm.pat, v)? {
-                            Cover::All => covered = true,
-                            Cover::Some => maybe = true,
-                            Cover::None => {}
-                        }
-                    }
-                    if !covered {
-                        if maybe {
-                            nested = true;
-                        } else {
-                            self.report(
-                                NodeRef::Expr(e),
-                                DiagnosticKind::NonExhaustive { missing: Some(v) },
-                            );
-                            return Ok(());
-                        }
-                    }
-                }
-                if nested {
-                    self.deferred.push(e);
-                }
-            }
-            Type::Prim(Prim::Bool) => {
-                for want in [true, false] {
-                    let hit = arms.iter().any(|arm| {
-                        arm.guard.is_none() && matches!(*hir.pat(arm.pat), hir_lang::Pat::Lit(Lit::Bool(b)) if b == want)
-                    });
-                    if !hit {
-                        self.report(
-                            NodeRef::Expr(e),
-                            DiagnosticKind::NonExhaustive { missing: None },
-                        );
-                        return Ok(());
-                    }
-                }
-            }
-            _ => {
-                // Numbers, strings, tuples...: without a catch-all only
-                // ranges or nested patterns could cover every value.
-                let structured = arms.iter().any(|a| {
-                    !matches!(
-                        *hir.pat(a.pat),
-                        hir_lang::Pat::Lit(_) | hir_lang::Pat::Path(_)
-                    )
-                });
-                if structured {
-                    self.deferred.push(e);
-                } else {
+                if !ok {
                     self.report(
                         NodeRef::Expr(e),
-                        DiagnosticKind::NonExhaustive { missing: None },
+                        DiagnosticKind::TryCarrier { ty: declared },
                     );
                 }
+                return Ok(inner);
             }
+            Type::Adt { item, .. } => {
+                if let Some((value_v, fail_v)) = self.carrier_variants(item) {
+                    let mut value = Vec::new();
+                    self.variant_field_types(t, value_v, &mut value)?;
+                    let value = value.first().copied().unwrap_or(TypeId::UNIT);
+                    // The function must return the same carrier.
+                    let ret_inst = self.adt_fresh(item);
+                    if !self.unify(declared, ret_inst)? {
+                        self.report(
+                            NodeRef::Expr(e),
+                            DiagnosticKind::TryCarrier { ty: declared },
+                        );
+                        return Ok(value);
+                    }
+                    if let Some(fv) = fail_v {
+                        let mut have = Vec::new();
+                        self.variant_field_types(t, fv, &mut have)?;
+                        let mut want = Vec::new();
+                        self.variant_field_types(ret_inst, fv, &mut want)?;
+                        if let (Some(&h), Some(&w)) = (have.first(), want.first()) {
+                            let snap = self.infer.snapshot();
+                            if self.unify(h, w)? {
+                                self.infer.commit();
+                            } else {
+                                self.infer.rollback(snap);
+                                match self.try_convert_iface() {
+                                    Some(iface) => {
+                                        let tr = self.types.trait_ref(iface, &[h]);
+                                        self.oblige_impl(w, tr, NodeRef::Expr(e));
+                                        self.coercions.push((
+                                            e,
+                                            crate::typed::Coercion::ErrorConvert,
+                                            w,
+                                        ));
+                                    }
+                                    None => self.report(
+                                        NodeRef::Expr(arg),
+                                        DiagnosticKind::Mismatch {
+                                            expected: w,
+                                            found: h,
+                                        },
+                                    ),
+                                }
+                            }
+                        }
+                    }
+                    return Ok(value);
+                }
+            }
+            _ => {}
+        }
+        if self.tag(t) != Tag::Var {
+            self.report(NodeRef::Expr(arg), DiagnosticKind::TryCarrier { ty: t });
+        }
+        Ok(TypeId::ERROR)
+    }
+
+    /// A carrier sum's success variant, and its failure variant when the
+    /// failure carries a value (result-like) rather than none (option-like).
+    fn carrier_variants(&self, item: hir_lang::ItemId) -> Option<(u32, Option<u32>)> {
+        let ItemKind::Sum(def) = self.item_kind(item) else {
+            return None;
+        };
+        let vs = self.hir.list(def.variants);
+        let [a, b] = vs else { return None };
+        let shape = |v: hir_lang::VariantId| self.hir.variant(v).map(|x| (x.shape, x.fields.len()));
+        match (shape(*a)?, shape(*b)?) {
+            ((hir_lang::Shape::Unit, _), (hir_lang::Shape::Tuple, 1)) => Some((1, None)),
+            ((hir_lang::Shape::Tuple, 1), (hir_lang::Shape::Unit, _)) => Some((0, None)),
+            ((hir_lang::Shape::Tuple, 1), (hir_lang::Shape::Tuple, 1)) => Some((0, Some(1))),
+            _ => None,
+        }
+    }
+
+    /// The field types of variant `v` of an instance of a sum.
+    fn variant_field_types(
+        &mut self,
+        t: TypeId,
+        v: u32,
+        out: &mut Vec<TypeId>,
+    ) -> Result<(), CheckError> {
+        let Type::Adt { item, .. } = self.types.get(self.resolve(t)) else {
+            return Ok(());
+        };
+        let ItemKind::Sum(def) = self.item_kind(item) else {
+            return Ok(());
+        };
+        let Some(&var) = self.hir.list(def.variants).get(v as usize) else {
+            return Ok(());
+        };
+        let fields = self
+            .hir
+            .variant(var)
+            .map(|x| self.hir.list(x.fields).to_vec())
+            .unwrap_or_default();
+        for f in fields {
+            out.push(self.field_type_in(f, t)?);
         }
         Ok(())
     }
-}
 
-/// How much of a variant a pattern covers.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Cover {
-    All,
-    Some,
-    None,
+    /// The conversion interface of the profile's `?` hook, by name.
+    fn try_convert_iface(&mut self) -> Option<hir_lang::ItemId> {
+        let crate::profile::TryHook::Intrinsic {
+            convert: Some(sym), ..
+        } = self.profile.try_hook
+        else {
+            return None;
+        };
+        if let Some(cached) = self.try_iface {
+            return cached;
+        }
+        let found = self
+            .tr
+            .ifaces
+            .iter()
+            .copied()
+            .find(|&i| self.item_symbol(i) == Some(sym));
+        self.try_iface = Some(found);
+        found
+    }
 }
 
 pub(crate) fn field_owner(target: RecordRef) -> FieldOwner {

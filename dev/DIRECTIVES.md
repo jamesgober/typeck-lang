@@ -13,7 +13,7 @@ This library is built and maintained to a production standard and treated as a f
 
 ## 1. What this is
 
-typeck-lang owns the checking traversal, the profiles, constraint generation and solving on top of type-lang's unifier, and typed diagnostics. It does not resolve names (resolve-lang) or compile patterns (match-lang).
+typeck-lang owns the checking traversal, the profiles, constraint generation and solving, and typed diagnostics. Solving runs on typeck-lang's own union-find store of interned type terms, not on type-lang 1's unifier, whose occurs check and resolution expand shared structure exponentially (ISSUES M39-M41); the decision and its reasoning are in `dev/ROADMAP.md` (v0.2.0, dependency wiring), with the recommendation that type-lang 2.0 adopt the store. It does not resolve names (resolve-lang) or compile patterns (match-lang).
 
 Configuring one checker covers the languages LexerSketch targets, from Mox (dynamic) to Kraken and Iron (static, inferred, generic), without writing a type checker per language.
 

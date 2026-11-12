@@ -135,7 +135,7 @@ expands `MixinUse`; until then member lookups on classes using mixins stay silen
 Exit criteria:
 - [x] Every public item has rustdoc and a runnable example; README and `docs/API.md` code blocks run as doctests.
 - [x] Property tests extend the typed generator to generics and interfaces with exact expected types, dispatch, and plan instances; single-mutation and error-node properties hold for generic programs.
-- [x] A corpus of Kraken-like hand-built programs checks with exact types, dispatch, plans, and diagnostics.
+- [x] A corpus of statically typed hand-built programs checks with exact types, dispatch, plans, and diagnostics.
 - [x] Benchmarks at 100k and 1M nodes for `static-inferred`, including generic-heavy programs; linear in program size.
 
 Delivered:
@@ -191,7 +191,7 @@ How the invariants are tested (in addition to v0.2.0's):
   cases).
 - *Profiles sound for what they claim*: rule tests `tests/inferred.rs`, `tests/traits.rs`,
   `tests/generics.rs`, `tests/exhaustive.rs`, `tests/mono.rs`, and the corpus
-  `tests/kraken_corpus.rs`.
+  `tests/generic_corpus.rs`.
 - *Shared structure never expanded / linear work*: step counts at 10k vs 20k nested generic
   calls and 2k vs 4k implementations; benchmarks at 100k and 1M nodes.
 
@@ -238,7 +238,7 @@ Operations on `any` are dynamic (`OpClass::Dynamic`, `promote` legal). `let` inf
 `static-explicit`. Soundness claim: a run-time type error can only occur at a recorded
 `FromAny` boundary.
 
-**`static-inferred`** (Kraken, Iron) — *delivered in v0.3.0 as described under v0.3.0
+**`static-inferred`** (Iron) — *delivered in v0.3.0 as described under v0.3.0
 above; the design note is kept for the record.* Bidirectional checking: expected types already flow
 down (0.2.0's expectation machinery becomes the checking mode); closures take parameter types
 from the expected function type; method calls and generic calls instantiate fresh variables
@@ -265,4 +265,4 @@ present, are checked as in `static-explicit`.
   target over the HIR binary decoder once hir-lang 0.5 ships it).
 
 ## v1.0.0 - Stable
-- [ ] Frozen after Mox, Mercury, and a Kraken subset check through it (D18).
+- [ ] Frozen after Mox, Mercury, and a statically typed language subset check through it (D18).

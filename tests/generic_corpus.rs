@@ -1,4 +1,4 @@
-//! A corpus of Kraken-like programs, built as HIR by hand and checked under
+//! A corpus of statically typed programs, built as HIR by hand and checked under
 //! `static-inferred`: generic containers, interface-dispatched methods (by
 //! bound, by `dyn`, through a bounded generic impl), closures passed to
 //! generic functions, `?` lowered as a template, an iterator interface with
@@ -508,7 +508,7 @@ fn test_iterator_with_bound_binding_and_where_clause() {
     assert_eq!(typed.binder(vb), Some(I64));
 }
 
-/// `match` over a Kraken token sum: a missing variant is reported with its
+/// `match` over a token sum: a missing variant is reported with its
 /// witness; an exhaustive match is silent.
 #[test]
 fn test_token_match_exhaustiveness() {

@@ -38,7 +38,7 @@
 
 ## What it does
 
-- **`static-inferred`** (Kraken, Iron): everything below, plus closures whose parameter and result types come from the expected function type (or from use), and `let x = null` typed as a nullable inferred from later uses.
+- **`static-inferred`** (Iron): everything below, plus closures whose parameter and result types come from the expected function type (or from use), and `let x = null` typed as a nullable inferred from later uses.
 - **Generics and interfaces** (both static disciplines): generic functions and types with bounds, where clauses, defaults, and constant parameters; interfaces (traits) with methods, default methods, constants, associated types (`T::Item`, `<T as I>::Item`, `I<Item = u8>`), and supertraits; `impl` blocks, generic ones included; interface methods resolved through bounds, `dyn` types, and implementations, with automatic receiver borrowing as a profile toggle; `impl Trait` parameters and results (the hidden type is reported); overlapping implementations and missing, extra, or mistyped members are reported. Checking mode flows through generic calls: an expected result type reaches the arguments, so a wrong argument is reported at itself.
 - **Unions and intersections** (`int|string`, `A & B`) from HIR v3, with injections and type tests.
 - **Exhaustiveness** through match-lang: the values a `match` misses are reported as patterns (`non-exhaustive match: Some(false) not covered`); unreachable arms and redundant or-alternatives are warnings.
@@ -57,7 +57,7 @@ What each guarantee rests on:
 | Well-typed programs check clean, with exactly the types they should have. | A typed generator builds random well-typed programs (arithmetic, comparisons, `if`, blocks, calls, tuples, arrays, records, sums with `match`, constructor calls, method calls, field access, indexing); property tests require no diagnostic, the generated type for every expression, and the right method for every method call. |
 | One mistake, one diagnostic, at the mistake. | Property: replacing one numeric literal of a well-typed program with `true` yields exactly one diagnostic, on that literal. Property: replacing any leaf with an error node yields none. |
 | Checking never panics and always terminates. | Property: random HIR of every form, repaired by `hir-lang`'s lenient validation, checks without panicking under three profiles, types every live expression and pattern, and is deterministic; under any step budget it finishes or returns `BudgetExceeded`. |
-| Generic programs check clean, with exactly the types, dispatch, and instances they should have. | A second typed generator builds programs over a generic record with a generic impl, a generic sum, an interface with a default method, an interface with an associated type and a bounded generic impl, bounded generic functions, and closures passed to generics; property tests require no diagnostic, the exact type (generic arguments included) of every expression, the exact method of every method call, and a plan instance with the exact arguments for every generic call. A corpus of Kraken-like programs (generic containers, interface dispatch by bound and by `dyn`, closures, `?`, an iterator interface, `match` exhaustiveness) checks expected types, dispatch, plans, and diagnostics. |
+| Generic programs check clean, with exactly the types, dispatch, and instances they should have. | A second typed generator builds programs over a generic record with a generic impl, a generic sum, an interface with a default method, an interface with an associated type and a bounded generic impl, bounded generic functions, and closures passed to generics; property tests require no diagnostic, the exact type (generic arguments included) of every expression, the exact method of every method call, and a plan instance with the exact arguments for every generic call. A corpus of statically typed programs (generic containers, interface dispatch by bound and by `dyn`, closures, `?`, an iterator interface, `match` exhaustiveness) checks expected types, dispatch, plans, and diagnostics. |
 | One mistake in a generic program, one diagnostic, at the mistake. | Property: replacing a numeric literal that an expectation reaches (through generic calls by checking mode, record literals, constructors, closure operands) with `true` yields exactly one diagnostic, on that literal; replacing any leaf with an error node yields none. |
 | Interface resolution terminates. | `impl<T: Tr> Tr for T` and an impl whose where clause needs ever-larger types are budget errors (`Limit::TraitDepth`), not hangs; supertrait cycles, cyclic generic aliases and defaults, and cyclic associated types terminate (the last two on a 1 MiB stack). Random HIR with generics, interfaces, impls, `dyn`, `impl Trait`, unions, and the v3 forms checks without panicking under five profiles. |
 | Shared type structure is never expanded (type-lang's ISSUES M39). | Types are hash-consed terms in a union-find store. Unifying two `Pair(v, v)` doubling chains is linear: step counts are compared at 2,000 and 4,000 levels, and 50,000 levels check in a test. |
@@ -125,11 +125,11 @@ Profiles start from a preset and adjust toggles:
 ```rust
 use typeck_lang::{MonoPolicy, Profile, RecordTyping};
 
-let kraken_like = Profile::static_inferred()
+let nominal = Profile::static_inferred()
     .with_records(RecordTyping::Nominal)
     .with_subtyping(true)
     .with_string_add(true);
-assert!(kraken_like.null_safety);
+assert!(nominal.null_safety);
 let iron_like = Profile::static_inferred().with_mono(MonoPolicy::Selective { max_nodes: 64 });
 assert!(iron_like.method_autoref);
 ```

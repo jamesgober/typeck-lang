@@ -16,7 +16,7 @@ use crate::mono::MonoPolicy;
 /// | `Dynamic` | Python, Lua, Mox | Only statically certain arity and shape errors | none: every value is `any` |
 /// | `Gradual` | TypeScript, Mercury | Where annotated; `any` at the boundaries | local |
 /// | `StaticExplicit` | C, Go, Zero | Everything | `let` initializers, literals, generic arguments |
-/// | `StaticInferred` | Kraken, Iron | Everything | bidirectional: also closure signatures from context |
+/// | `StaticInferred` | Iron | Everything | bidirectional: also closure signatures from context |
 /// | `Hm` | ML family | Everything | full, with let-polymorphism |
 ///
 /// Both static disciplines check generic items, interfaces (traits), `impl`
@@ -105,7 +105,7 @@ impl Discipline {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum RecordTyping {
     /// Two record declarations are different types even with equal fields
-    /// (Rust, C, Kraken).
+    /// (Rust, C).
     Nominal,
     /// Records with the same field names and types are the same type, and an
     /// anonymous record literal of that shape has it (TypeScript, Go's
@@ -119,7 +119,7 @@ pub enum RecordTyping {
 /// All three resolve members through the same engine (`impl` blocks and
 /// classes' declared interfaces are both implementations). The difference is
 /// what an interface name means where a type is expected: with
-/// `Interfaces`, the interface type (a `dyn` value, as in Java or Kraken);
+/// `Interfaces`, the interface type (a `dyn` value, as in Java or Rust);
 /// with `Traits` and `Typeclasses`, an error (write `dyn Trait` or
 /// `impl Trait`).
 ///
@@ -135,7 +135,7 @@ pub enum Polymorphism {
     /// Nominal implementations, coherent, separate from the type (Rust).
     Traits,
     /// Declared at the class, checked structurally against the interface
-    /// (Java, Go, Kraken).
+    /// (Java, Go).
     Interfaces,
     /// Dictionary-passing typeclasses (Haskell).
     Typeclasses,
@@ -230,7 +230,7 @@ pub struct Profile {
     /// `f64`, integers to floats that hold them exactly), and integer
     /// literals may type as floats.
     pub numeric_widening: bool,
-    /// `null` inhabits only `T?` types (Kotlin, Kraken). When `false`, `null`
+    /// `null` inhabits only `T?` types (Kotlin). When `false`, `null`
     /// coerces to any non-value type: references, pointers, nominal types,
     /// functions, strings, slices, maps (Java, Go).
     pub null_safety: bool,
@@ -358,7 +358,7 @@ impl Profile {
         }
     }
 
-    /// Kraken, Iron: bidirectional inference, generics, traits.
+    /// Iron: bidirectional inference, generics, traits.
     ///
     /// As [`static_explicit`](Self::static_explicit), with traits, closure
     /// signatures inferred from context, and `let x = null` giving a nullable

@@ -2,7 +2,7 @@
 
 > Complete reference for every public item in `typeck-lang`, with examples.
 > **Status: pre-1.0 (0.3.0).** The surface is designed across the 0.x series
-> and frozen at 1.0.0, after Mox, Mercury, and a Kraken subset have checked
+> and frozen at 1.0.0, after Mox, Mercury, and a statically typed language subset have checked
 > through it (LexerSketch decision D18). See
 > [`../dev/ROADMAP.md`](../dev/ROADMAP.md).
 
@@ -137,7 +137,7 @@ A profile is a discipline plus toggles. The disciplines:
 | `Dynamic` | Python, Lua, Mox | Only statically certain arity and shape errors | none: every value is `any` | implemented |
 | `Gradual` | TypeScript, Mercury | Where annotated; `any` at the boundaries | local | designed (0.5) |
 | `StaticExplicit` | C, Go, Zero | Everything | `let` initializers, literals, generic arguments | implemented |
-| `StaticInferred` | Kraken, Iron | Everything | bidirectional: also closure signatures | implemented |
+| `StaticInferred` | Iron | Everything | bidirectional: also closure signatures | implemented |
 | `Hm` | ML family | Everything | full, let-polymorphism | designed (0.5) |
 
 Both static disciplines check generics, interfaces, `impl` blocks, associated

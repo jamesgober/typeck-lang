@@ -23,7 +23,7 @@
 
 ## [0.3.0] - 2026-10-09
 
-The `static-inferred` discipline (Kraken, Iron): bidirectional checking,
+The `static-inferred` discipline (Iron): bidirectional checking,
 generics, interfaces (traits) with associated types and default methods,
 `impl` blocks (generic ones indexed), `dyn` and `impl Trait`, closures with
 inferred signatures, a monomorphization plan with a selective policy, and `?`
@@ -119,7 +119,7 @@ through a profile hook. Exhaustiveness is decided by match-lang. HIR v3
   per profile, assignment values, `?`.
 - Tests: `tests/inferred.rs`, `tests/traits.rs`, `tests/generics.rs`,
   `tests/exhaustive.rs`, `tests/mono.rs` (plan and `?`),
-  `tests/kraken_corpus.rs` (Kraken-like programs),
+  `tests/generic_corpus.rs` (statically typed programs),
   `tests/adversarial_generics.rs` (deep generics, recursive bounds, cycles,
   scale, small stacks), `tests/properties_generic.rs` (a typed generator over
   generics and interfaces: exact types, dispatch, and plan instances;

@@ -51,7 +51,7 @@ pub enum Strategy {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum MonoPolicy {
-    /// Copy every generic item (Rust, Kraken).
+    /// Copy every generic item (Rust).
     Copy,
     /// Share every generic item (dictionary passing everywhere).
     Shared,

@@ -1,7 +1,6 @@
 # typeck-lang - Roadmap
 
 > Path from scaffold to a stable 1.0. Hard parts are front-loaded; each phase has hard exit criteria.
-> Master plan: ../_lexersketch/ROADMAP.md and ../_lexersketch/NEW-LIBS.md
 >
 > **Anti-deferral rule:** no listed hard task moves to a later phase unless this file records the move and the reason.
 
@@ -99,7 +98,7 @@ Dependency wiring (decided here, recorded per the anti-deferral rule):
     breaking change for typeck-lang's users.
 - **resolve-lang, match-lang: not wired.** typeck consumes resolutions already in the HIR and
   defers precise exhaustiveness to match-lang through `Typed::deferred_matches`; the
-  LexerSketch app connects them (single responsibility). *(Superseded in v0.3.0: match-lang is
+  toolchain app connects them (single responsibility). *(Superseded in v0.3.0: match-lang is
   wired and decides exhaustiveness; `deferred_matches` is gone. resolve-lang stays unwired.)*
 
 Moved to v0.5.0 (anti-deferral record; **all of these except the `gradual` and `hm`
@@ -211,7 +210,7 @@ each is reported, never guessed):
   second level of projection resolution; scheduled with `hm` in v0.5.0, where higher-order
   types are designed.
 - **Orphan rules**: not this crate's job. They depend on crate (unit-group) boundaries that a
-  single unit does not see; the LexerSketch app, which sees every unit, owns them. Overlap
+  single unit does not see; the toolchain's app, which sees every unit, owns them. Overlap
   (the part selection's soundness needs) is checked here.
 - **Object safety of `dyn` interfaces** (generic methods, `Self` in argument position): not
   checked in 0.3; v0.5.0 with the `gradual` boundary work, which also designs vtables.

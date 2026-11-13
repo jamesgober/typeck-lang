@@ -1,13 +1,12 @@
 # typeck-lang &mdash; Engineering Directives
 
 > Engineering standards and the definition of done for this project. Read alongside `REPS.md` (root, authoritative) and `dev/ROADMAP.md` (current phase). If anything here conflicts with `REPS.md`, `REPS.md` wins.
-> Family plan: `../_lexersketch/` (README rules of engagement, ARCHITECTURE, ISSUES, ROADMAP).
 
 ---
 
 ## 0. Philosophy
 
-This library is built and maintained to a production standard and treated as a flagship piece of work. Plan the full path, then build one verified step at a time. "Good enough" is treated as a defect. It is part of the semantic analysis tier (SEMA) of the `-lang` family that LexerSketch assembles.
+This library is built and maintained to a production standard and treated as a flagship piece of work. Plan the full path, then build one verified step at a time. "Good enough" is treated as a defect. It is part of the semantic analysis tier (SEMA) of the `-lang` family that the toolchain assembles.
 
 ---
 
@@ -15,7 +14,7 @@ This library is built and maintained to a production standard and treated as a f
 
 typeck-lang owns the checking traversal, the profiles, constraint generation and solving, and typed diagnostics. Solving runs on typeck-lang's own union-find store of interned type terms, not on type-lang 1's unifier, whose occurs check and resolution expand shared structure exponentially (ISSUES M39-M41); the decision and its reasoning are in `dev/ROADMAP.md` (v0.2.0, dependency wiring), with the recommendation that type-lang 2.0 adopt the store. It does not resolve names (resolve-lang) or compile patterns into decision trees; exhaustiveness and usefulness are decided by match-lang, over a model of typeck's types.
 
-Configuring one checker covers the languages LexerSketch targets, from Mox (dynamic) to Iron (static, inferred, generic), without writing a type checker per language.
+Configuring one checker covers the languages the toolchain targets, from Mox (dynamic) to Iron (static, inferred, generic), without writing a type checker per language.
 
 ---
 
@@ -42,7 +41,7 @@ Configuring one checker covers the languages LexerSketch targets, from Mox (dyna
 6. Property tests cover every section-4 invariant; a fuzz target exists for every decoder or parser.
 7. Hot-path changes carry benchmarks; no regression over 5%.
 8. `README.md`, `docs/API.md`, and `CHANGELOG.md` updated; the matching `docs/release/vX.Y.Z.md` written before the tag.
-9. v1.0.0 only after a real consumer has exercised the API end to end (LexerSketch decision D18).
+9. v1.0.0 only after a real consumer has exercised the API end to end (decision D18).
 
 ---
 

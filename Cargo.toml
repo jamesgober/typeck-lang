@@ -19,7 +19,7 @@ readme = "README.md"
 description = "Profile-driven type checking over HIR: dynamic, gradual, static (generics, traits, inference), and Hindley-Milner from one checker."
 
 # Keywords (5 max)
-keywords = ["typechecker", "inference", "types", "compiler", "lexersketch"]
+keywords = ["typechecker", "inference", "types", "compiler"]
 
 # Categories
 categories = ["compilers", "development-tools", "no-std"]
